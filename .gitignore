@@ -1,0 +1,18 @@
+# 运行产物 / 本机临时文件
+__pycache__/
+*.pyc
+_build/
+_verify/
+dist/
+build/
+*.log
+*.pem
+
+# 工具/智能体的本地记忆，不属于项目源码
+.workbuddy/
+
+# 单文件 exe 不进仓库，只放到 Releases 里（保持仓库轻量）
+hardsub.exe
+
+# 用来演示/测试的真实字幕素材（含有具体视频内容，不上传）
+Escaping_the_Minecraft_Underworld*.ass
