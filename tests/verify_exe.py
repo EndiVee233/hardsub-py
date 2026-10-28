@@ -10,7 +10,8 @@ hardsub.exe 黑盒验证（exe 是外部进程，只能从外面看行为）。
   1. --probe / --list 能跑通，中文输出是干净的 UTF-8（不是 GBK 乱码）
   2. 真实压制（CPU + 硬件）后，逐帧统计画面亮度，确认第一条字幕真的被烧进去了
   3. 音轨数 / 时长 / 分辨率保持一致
-  4. 参数错误、文件不存在时退出码正确，不静默失败
+  4. HDR：输出保持 10bit + BT.2020/PQ；--tonemap 输出 BT.709 8bit
+  5. 参数错误、文件不存在时退出码正确，不静默失败
 """
 
 from __future__ import annotations
@@ -106,6 +107,35 @@ def main() -> int:
             if okc:
                 lit = T.brightness_at(out_hw, 0.04)
                 check(f"{accel} 首条字幕在画面里", lit > 5, f"亮像素 {lit}")
+
+        # ---------- 3.5 HDR ----------
+        print("\n[3.5] HDR")
+        hdr_video = d / "HDR 素材.mp4"
+        hdr_ass = d / "HDR 字幕.ass"
+        T.make_hdr_video(hdr_video)
+        T.make_ass(hdr_ass, 10)
+
+        out_hdr = d / "hdr 输出.mp4"
+        r = run_exe(["-v", str(hdr_video), "-s", str(hdr_ass), "-a", "cpu", "-c", "h265",
+                     "-y", "-o", str(out_hdr), "--overwrite"])
+        check("HDR 压制退出码 0", r.returncode == 0, (r.stderr or "").strip()[:200])
+        if out_hdr.is_file():
+            got = T.hardsub.ffprobe_media(T.FFPROBE, out_hdr)
+            check("HDR 输出是 10bit", got.depth == 10, got.pix_fmt)
+            check("HDR 色彩标签保留",
+                  got.color_transfer == "smpte2084" and got.color_primaries == "bt2020",
+                  f"{got.color_primaries}/{got.color_transfer}")
+            check("HDR 字幕在画面里", T.brightness_at(out_hdr, 0.04, size="320x180") > 5)
+
+        out_sdr = d / "hdr 转 sdr.mp4"
+        r = run_exe(["-v", str(hdr_video), "-s", str(hdr_ass), "-a", "cpu", "-c", "h265",
+                     "--tonemap", "-y", "-o", str(out_sdr), "--overwrite"])
+        check("HDR→SDR 退出码 0", r.returncode == 0, (r.stderr or "").strip()[:200])
+        if out_sdr.is_file():
+            got = T.hardsub.ffprobe_media(T.FFPROBE, out_sdr)
+            check("SDR 输出是 8bit / bt709",
+                  got.depth == 8 and got.color_transfer == "bt709",
+                  f"{got.pix_fmt} {got.color_transfer}")
 
         # ---------- 4. 错误路径 ----------
         print("\n[4] 错误路径")

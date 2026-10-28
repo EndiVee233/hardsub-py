@@ -14,8 +14,13 @@ hardsub.py — 智能硬编码(烧录)字幕 · 命令行版
      跑不通就自动回退 CPU，避免白等一小时才发现失败。
   3. 修复"第一条字幕被吞"的 bug（见 inject_sacrificial_event 的注释）。
   4. 保留全部音轨（旧脚本 -acodec copy 只会留一条），音轨与封装不兼容时自动转 AAC。
-  5. 进度条 + 压制后自动校验（时长 / 分辨率 / 音轨数）。
+  5. 进度条 + 压制后自动校验（时长 / 分辨率 / 音轨数 / HDR 元数据）。
   6. 全参数化命令行，可被其它脚本调度。
+  7. HDR（HDR10 / HLG）全程 10bit，写回 BT.2020 + PQ/HLG 标签，保留 HDR10 静态元数据；
+     硬件链路的 hwdownload/hwupload 按位深用 p010le，不再因为写死 nv12 而整条失败。
+     --tonemap 可以把 HDR 转成 SDR（BT.709 8bit）。
+  8. 进度条不会再被 ffmpeg 的警告卡住：stdout/stderr 各一个读取线程，进度字段三级回退，
+     结束时汇总警告、失败时打印真正的错误行。
 
 用法示例：
   hardsub.exe                                    交互式，扫描当前目录
@@ -35,11 +40,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".flv", ".webm", ".avi", ".m4v", ".ts",
               ".wmv", ".mpg", ".mpeg", ".rmvb")
@@ -64,6 +71,10 @@ VENDOR_LABEL = {"nvidia": "NVIDIA NVENC", "amd": "AMD AMF", "intel": "Intel QSV"
 
 # 这些音频编码无法放进 mp4/mov 时需要转码
 MP4_OK_AUDIO = {"aac", "mp3", "ac2", "ac3", "eac3", "alac", "mp2", "opus", "dts"}
+
+# HDR 的传递特性 -> 给人看的名字。HDR10 用 PQ，HLG 是广电那套。
+HDR_TRANSFERS = {"smpte2084": "HDR10（PQ）", "arib-std-b67": "HLG"}
+UNKNOWN_TAGS = {"", "unknown", "unspecified", "reserved", "n/a", "none"}
 
 
 # ==========================================================================
@@ -214,6 +225,24 @@ def list_encoders(ffmpeg: str) -> set[str]:
     return _ENC_LIST
 
 
+_FILTER_LIST: set[str] | None = None
+
+
+def list_filters(ffmpeg: str) -> set[str]:
+    """本 ffmpeg 里有哪些滤镜（判断能不能做 HDR→SDR 色调映射）。"""
+    global _FILTER_LIST
+    if _FILTER_LIST is None:
+        out = run_capture([ffmpeg, "-hide_banner", "-filters"]).stdout or ""
+        names = set()
+        for line in out.splitlines():
+            # 形如 " .. libplacebo   N->V ..." / " TS aap   AA->A ..."（前导空格 + 标记位）
+            m = re.match(r"^\s*[A-Z.]{2,3}\s+(\S+)\s", line)
+            if m:
+                names.add(m.group(1))
+        _FILTER_LIST = names
+    return _FILTER_LIST
+
+
 # ==========================================================================
 # 媒体信息
 # ==========================================================================
@@ -226,6 +255,32 @@ class Media:
     fps: float = 0.0
     v_index: int = 0
     audio: list[str] = field(default_factory=list)
+    # ---- 色彩信息（HDR 判定靠这几个字段） ----
+    pix_fmt: str = ""
+    depth: int = 8
+    color_primaries: str = ""
+    color_transfer: str = ""
+    color_space: str = ""
+    color_range: str = ""
+    hdr: str = ""                  # "" / "HDR10（PQ）" / "HLG"
+    dovi: bool = False             # 杜比视界（重编码会丢 DV 层，这里只提示）
+    master_display: str = ""       # 已经转成 x265 -x265-params 的写法
+    max_cll: str = ""              # "MaxCLL,MaxFALL"
+
+
+def pix_fmt_depth(pix_fmt: str) -> int:
+    """
+    从像素格式名猜位深：yuv420p10le / p010le -> 10，yuv420p / nv12 -> 8。
+    位深一定跟在 'p'（或 gray）后面；nv12 / nv21 结尾的 12、21 是采样方式，不能当位深。
+    """
+    m = re.search(r"(?:p[0-9]?|gray)(9|10|12|14|16)(?:le|be)?$", (pix_fmt or "").strip().lower())
+    return int(m.group(1)) if m else 8
+
+
+def clean_tag(value) -> str:
+    """ffprobe 会给 'unknown' / 'reserved'，统一当成空。"""
+    text = str(value or "").strip()
+    return "" if text.lower() in UNKNOWN_TAGS else text
 
 
 def parse_fps(text: str) -> float:
@@ -237,6 +292,71 @@ def parse_fps(text: str) -> float:
         return float(text)
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def probe_ratio(value) -> float | None:
+    """ffprobe 的 '34000/50000' 这种分数转成 float。"""
+    try:
+        text = str(value)
+        if "/" in text:
+            num, den = text.split("/", 1)
+            den_f = float(den)
+            return float(num) / den_f if den_f else None
+        return float(text)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def master_display_param(side: dict) -> str:
+    """
+    把 ffprobe 的 Mastering display metadata 转成 x265 的 master-display 写法。
+    x265 的坐标单位是 0.00002（×50000），亮度单位是 0.0001 cd/m²（×10000）。
+    """
+    coords = (("G", "green_x", "green_y"), ("B", "blue_x", "blue_y"),
+              ("R", "red_x", "red_y"), ("WP", "white_point_x", "white_point_y"))
+    parts = []
+    for name, kx, ky in coords:
+        x, y = probe_ratio(side.get(kx)), probe_ratio(side.get(ky))
+        if x is None or y is None:
+            return ""
+        parts.append(f"{name}({round(x * 50000)},{round(y * 50000)})")
+    peak, low = probe_ratio(side.get("max_luminance")), probe_ratio(side.get("min_luminance"))
+    if peak is None or low is None:
+        return ""
+    parts.append(f"L({round(peak * 10000)},{round(low * 10000)})")
+    return "".join(parts)
+
+
+def ffprobe_hdr_metadata(ffprobe: str, path: Path) -> tuple[str, str, bool]:
+    """
+    解第一帧拿 HDR10 静态元数据（Mastering display / MaxCLL）。
+    这些信息 ffprobe 的 -show_streams 里没有，只挂在帧的 side data 上。
+    返回 (master-display, "MaxCLL,MaxFALL", 是否 Dolby Vision)。
+    """
+    cmd = [ffprobe, "-v", "error", "-select_streams", "v:0",
+           "-read_intervals", "%+#1", "-show_frames",
+           "-show_entries", "frame=side_data_list", "-print_format", "json", str(path)]
+    res = run_capture(cmd)
+    master_display = max_cll = ""
+    dovi = False
+    if res.returncode != 0:
+        return master_display, max_cll, dovi
+    try:
+        frames = json.loads(res.stdout or "{}").get("frames", [])
+    except json.JSONDecodeError:
+        return master_display, max_cll, dovi
+    for frame in frames:
+        for side in frame.get("side_data_list") or []:
+            kind = str(side.get("side_data_type") or "")
+            if kind.startswith("Mastering display"):
+                master_display = master_display or master_display_param(side)
+            elif kind.startswith("Content light level"):
+                mc, ma = side.get("max_content"), side.get("max_average")
+                if isinstance(mc, int) and isinstance(ma, int):
+                    max_cll = max_cll or f"{mc},{ma}"
+            elif "DOVI" in kind.upper() or "Dolby Vision" in kind:
+                dovi = True
+    return master_display, max_cll, dovi
 
 
 def ffprobe_media(ffprobe: str, path: Path) -> Media:
@@ -261,6 +381,31 @@ def ffprobe_media(ffprobe: str, path: Path) -> Media:
     m.height = int(v.get("height") or 0)
     m.fps = parse_fps(v.get("r_frame_rate") or v.get("avg_frame_rate") or "0/0")
     m.audio = [a.get("codec_name", "?") for a in audios]
+
+    # ---- 色彩 / HDR ----
+    m.pix_fmt = clean_tag(v.get("pix_fmt"))
+    m.depth = pix_fmt_depth(m.pix_fmt)
+    m.color_primaries = clean_tag(v.get("color_primaries"))
+    m.color_transfer = clean_tag(v.get("color_transfer"))
+    m.color_space = clean_tag(v.get("color_space"))
+    m.color_range = clean_tag(v.get("color_range"))
+    m.hdr = HDR_TRANSFERS.get(m.color_transfer, "")
+    for side in v.get("side_data_list") or []:
+        kind = str(side.get("side_data_type") or "")
+        if "DOVI" in kind.upper() or "Dolby Vision" in kind:
+            m.dovi = True
+        elif kind.startswith("Mastering display"):
+            m.master_display = master_display_param(side)
+        elif kind.startswith("Content light level"):
+            mc, ma = side.get("max_content"), side.get("max_average")
+            if isinstance(mc, int) and isinstance(ma, int):
+                m.max_cll = f"{mc},{ma}"
+    if m.hdr:      # 静态 HDR 元数据只在帧的 side data 里，多跑一次 ffprobe 解一帧
+        md, cll, dovi = ffprobe_hdr_metadata(ffprobe, path)
+        m.master_display = m.master_display or md
+        m.max_cll = m.max_cll or cll
+        m.dovi = m.dovi or dovi
+
     for src in (data.get("format", {}).get("duration"), v.get("duration")):
         try:
             m.duration = float(src)  # type: ignore[arg-type]
@@ -567,6 +712,10 @@ class Plan:
     input_opts: list[str]
     enc_params: list[str]
     quality: int
+    pix_fmt: str = "yuv420p"       # 滤镜链尾部 / 编码器像素格式
+    hdr: bool = False
+    color_opts: list[str] = field(default_factory=list)
+    hw_pix_fmt: str = ""           # 硬件帧下载到内存后的格式（10bit=p010le）
     filters: str = ""
 
 
@@ -582,16 +731,112 @@ def accel_input_opts(accel: str) -> list[str]:
     }[accel]
 
 
-def build_filters(sub_filter: str, accel: str) -> str:
+def hw_upload_filter(accel: str) -> str:
+    return {"nvidia": "hwupload_cuda",
+            "amd": "hwupload=derive_device=d3d11va",
+            "intel": "hwupload=derive_device=qsv"}[accel]
+
+
+def build_filters(sub_filter: str, accel: str, pix_fmt: str = "yuv420p",
+                  tonemap_filters: str = "", hw_pix_fmt: str = "") -> str:
+    """
+    组装滤镜链。
+
+    HDR 的坑：10bit 源解到显存后是 p010 帧，`hwdownload` 只能输出 p010le；
+    旧代码写死 `format=nv12`，会直接报 "Invalid output format nv12 for hwframe
+    download"，硬件链路整条不可用。这里按位深选格式（8bit=nv12，10bit=p010le）。
+
+    `hwdownload` 后面紧跟一个 format 把下载格式钉死也很重要：后面接 zscale 时，
+    滤镜图会自己协商格式，曾经协商出 gray 直接把硬件链路搞挂。
+
+    tonemap_filters 只在 --tonemap 时出现，且必须排在 subtitles 前面：
+    先把 HDR 压成 SDR，再烧字幕，字幕才会是正常的 SDR 白色，而不是被一起压暗。
+    """
+    parts: list[str] = []
+    if accel != "cpu":
+        parts.append("hwdownload")
+        if hw_pix_fmt:
+            parts.append(f"format={hw_pix_fmt}")
+    if tonemap_filters:
+        parts.append(tonemap_filters)
+    parts.append(sub_filter)
+    parts.append(f"format={pix_fmt}")
+    if accel != "cpu":
+        parts.append(hw_upload_filter(accel))
+    return ",".join(parts)
+
+
+def hdr_encoder_profile(accel: str, encoder: str) -> list[str]:
+    """10bit HDR 要让硬件编码器显式开 Main10 / High10，否则它会按 8bit 编码。"""
+    profile = {("nvidia", "hevc_nvenc"): "main10",
+               ("nvidia", "h264_nvenc"): "high10",
+               ("amd", "hevc_amf"): "main10",
+               ("intel", "hevc_qsv"): "main10"}.get((accel, encoder))
+    return ["-profile:v", profile] if profile else []
+
+
+def color_opts_for(media: Media | None, hdr: bool, tonemapped: bool) -> list[str]:
+    """HDR 必须显式写回色彩标签，否则播放器会把 PQ 数据当 BT.709 显示（画面发灰）。"""
+    if hdr and media is not None:
+        return ["-color_primaries", "bt2020",
+                "-color_trc", media.color_transfer or "smpte2084",
+                "-colorspace", "bt2020nc", "-color_range", "tv"]
+    if tonemapped:
+        return ["-color_primaries", "bt709", "-color_trc", "bt709",
+                "-colorspace", "bt709", "-color_range", "tv"]
+    return []
+
+
+TONEMAP_ZSCALE = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                  "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+TONEMAP_LIBPLACEBO = ("libplacebo=tonemapping=bt.2390:colorspace=bt709:"
+                      "color_primaries=bt709:color_trc=bt709:format=yuv420p")
+
+
+def pick_tonemap(ffmpeg: str) -> tuple[str, str]:
+    """
+    HDR → SDR 的滤镜链。
+    优先 zscale + tonemap（纯 CPU、不依赖显卡驱动），没有 libzimg 时退到 libplacebo。
+    """
+    filters = list_filters(ffmpeg)
+    if {"zscale", "tonemap"} <= filters:
+        return TONEMAP_ZSCALE, "zscale + tonemap(hable)"
+    if "libplacebo" in filters:
+        return TONEMAP_LIBPLACEBO, "libplacebo(bt.2390)"
+    raise RuntimeError("这个 ffmpeg 没有 zscale/tonemap 或 libplacebo 滤镜，无法 HDR→SDR；"
+                       "请换用带 libzimg 的完整版 ffmpeg，或去掉 --tonemap 保留 HDR")
+
+
+def hdr_x265_params(media: Media) -> list[str]:
+    """x265 需要显式打开 HDR 支持，否则不写 HDR10 的 SEI。"""
+    params = ["repeat-headers=1",
+              f"colorprim={media.color_primaries or 'bt2020'}",
+              f"transfer={media.color_transfer or 'smpte2084'}",
+              f"colormatrix={media.color_space or 'bt2020nc'}"]
+    if media.color_transfer == "smpte2084":
+        # hdr-opt 是 HDR10（PQ）专用的；HLG 上开它 x265 会警告并自行关掉
+        params.insert(0, "hdr-opt=1")
+    if media.master_display:
+        params.append(f"master-display={media.master_display}")
+    if media.max_cll:
+        params.append(f"max-cll={media.max_cll}")
+    return params
+
+
+def build_plan(ffmpeg: str, accel: str, codec: str, quality: int,
+               media: Media | None = None, tonemapped: bool = False) -> Plan:
+    hdr = bool(media and media.hdr and not tonemapped)
     if accel == "cpu":
-        return f"{sub_filter},format=yuv420p"
-    tail = {"nvidia": "format=nv12,hwupload_cuda",
-            "amd": "format=nv12,hwupload=derive_device=d3d11va",
-            "intel": "format=nv12,hwupload=derive_device=qsv"}[accel]
-    return f"hwdownload,{sub_filter},{tail}"
+        pix_fmt = "yuv420p10le" if hdr else "yuv420p"
+    else:
+        # 压缩前的像素格式：8bit 用 nv12，10bit 必须用 p010le
+        pix_fmt = "p010le" if hdr else "nv12"
+    # 硬件帧下载到内存后的格式由【源】的位深决定（10bit 源就是 p010le）
+    hw_pix_fmt = ""
+    if accel != "cpu":
+        hw_pix_fmt = "p010le" if (media and media.depth > 8) else "nv12"
+    color_opts = color_opts_for(media, hdr, tonemapped)
 
-
-def build_plan(ffmpeg: str, accel: str, codec: str, quality: int) -> Plan:
     if accel == "cpu":
         encoder = pick_cpu_encoder(ffmpeg, codec)
         if not encoder:
@@ -599,7 +844,10 @@ def build_plan(ffmpeg: str, accel: str, codec: str, quality: int) -> Plan:
         params = ["-crf", str(quality)]
         # libsvtav1 的 preset 是数字(0-13)，写 "medium" 会直接报错
         params += ["-preset", "8" if encoder == "libsvtav1" else "medium"]
-        return Plan("cpu", codec, encoder, [], params, quality)
+        if hdr and encoder == "libx265" and media is not None:
+            params += ["-x265-params", ":".join(hdr_x265_params(media))]
+        return Plan("cpu", codec, encoder, [], params, quality,
+                    pix_fmt=pix_fmt, hdr=hdr, color_opts=color_opts)
 
     encoder = HW_ENCODERS[accel][codec]
     if not encoder_available(ffmpeg, encoder):
@@ -611,7 +859,10 @@ def build_plan(ffmpeg: str, accel: str, codec: str, quality: int) -> Plan:
                   "-qp_b", str(quality), "-quality", "quality"]
     else:
         params = ["-global_quality", str(quality), "-look_ahead", "1"]
-    return Plan(accel, codec, encoder, accel_input_opts(accel), params, quality)
+    if hdr:
+        params += hdr_encoder_profile(accel, encoder)
+    return Plan(accel, codec, encoder, accel_input_opts(accel), params, quality,
+                pix_fmt=pix_fmt, hdr=hdr, color_opts=color_opts, hw_pix_fmt=hw_pix_fmt)
 
 
 def default_quality_for(codec: str, accel: str) -> int:
@@ -648,8 +899,10 @@ def sub_filter_opts(sub_tmp: Path, fonts_dir: Path | None) -> str:
 
 
 def build_ffmpeg_cmd(ffmpeg: str, plan: Plan, media: Media, sub_tmp: Path, out_path: Path,
-                     fonts_dir: Path | None, threads: int, loglevel: str) -> list[str]:
-    plan.filters = build_filters(sub_filter_opts(sub_tmp, fonts_dir), plan.accel)
+                     fonts_dir: Path | None, threads: int, loglevel: str,
+                     tonemap_filters: str = "") -> list[str]:
+    plan.filters = build_filters(sub_filter_opts(sub_tmp, fonts_dir), plan.accel,
+                                 plan.pix_fmt, tonemap_filters, plan.hw_pix_fmt)
 
     cmd = [ffmpeg, "-hide_banner", "-loglevel", loglevel, "-y", "-nostdin"]
     cmd += plan.input_opts
@@ -658,9 +911,10 @@ def build_ffmpeg_cmd(ffmpeg: str, plan: Plan, media: Media, sub_tmp: Path, out_p
         cmd += ["-map", "0:a?"]
     cmd += ["-map_metadata", "0", "-vf", plan.filters, "-c:v", plan.encoder]
     cmd += plan.enc_params
+    cmd += plan.color_opts                 # HDR: 显式写回 bt2020 / PQ(HLG) 标签
     cmd += ["-g", str(gop_for_fps(media.fps))]
     if plan.accel == "cpu":
-        cmd += ["-pix_fmt", "yuv420p"]      # 硬件链路不能加，否则会把 hw 帧拉回内存
+        cmd += ["-pix_fmt", plan.pix_fmt]  # 硬件链路不能加，否则会把 hw 帧拉回内存
     if plan.codec == "h265" and out_path.suffix.lower() in (".mp4", ".mov"):
         cmd += ["-tag:v", "hvc1"]           # 让 QuickTime / 手机相册能认
     if media.audio:
@@ -676,22 +930,44 @@ def build_ffmpeg_cmd(ffmpeg: str, plan: Plan, media: Media, sub_tmp: Path, out_p
     return cmd
 
 
+_FFMPEG_PREFIX_RE = re.compile(r"^\s*\[[^\]]*@[^\]]*\]\s*")
+_MEANINGFUL_ERR_RE = re.compile(
+    r"(?i)(invalid|error|failed|not supported|no capable|unable|cannot|doesn't support)")
+
+
+def clean_ffmpeg_line(line: str) -> str:
+    return _FFMPEG_PREFIX_RE.sub("", line.strip())
+
+
+def pick_error_line(stderr: str) -> str:
+    """
+    从 ffmpeg 的 stderr 里挑一条最像"根因"的。
+    旧实现直接取最后一行，结果经常取到 "Nothing was written into output file"
+    这种善后信息，真正的原因（比如 Invalid output format nv12）反而被吞掉。
+    """
+    lines = [clean_ffmpeg_line(ln) for ln in (stderr or "").splitlines() if ln.strip()]
+    for line in lines:
+        if _MEANINGFUL_ERR_RE.search(line) and "Nothing was written" not in line:
+            return line
+    return lines[-1] if lines else "未知错误"
+
+
 def validate_chain(ffmpeg: str, plan: Plan, media: Media, sub_tmp: Path,
-                   fonts_dir: Path | None) -> tuple[bool, str]:
+                   fonts_dir: Path | None, tonemap_filters: str = "") -> tuple[bool, str]:
     """
     正式压制前用真实视频试跑 0.5 秒整条链路（硬解 + 滤镜 + 编码）。
     硬件方案常常"能列出编码器但跑不动"，提前 0.5 秒验证可以避免白等一小时。
     """
-    filters = build_filters(sub_filter_opts(sub_tmp, fonts_dir), plan.accel)
+    filters = build_filters(sub_filter_opts(sub_tmp, fonts_dir), plan.accel,
+                            plan.pix_fmt, tonemap_filters, plan.hw_pix_fmt)
     cmd = [ffmpeg, "-hide_banner", "-v", "error", "-y"]
     cmd += plan.input_opts
     cmd += ["-i", str(media.path), "-t", "0.5", "-an", "-vf", filters,
-            "-c:v", plan.encoder] + plan.enc_params + ["-f", "null", "-"]
+            "-c:v", plan.encoder] + plan.enc_params + plan.color_opts + ["-f", "null", "-"]
     res = run_capture(cmd)
     if res.returncode == 0:
         return True, ""
-    tail = [ln for ln in (res.stderr or "").strip().splitlines() if ln.strip()]
-    return False, tail[-1] if tail else "未知错误"
+    return False, pick_error_line(res.stderr or "")
 
 
 # ==========================================================================
@@ -706,43 +982,232 @@ def human_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def run_encode(cmd: list[str], duration: float) -> int:
-    """跑 ffmpeg，解析 -progress 输出画进度条。"""
+class ProgressState:
+    """ffmpeg -progress 的最新状态：读取线程写，主线程读。"""
+
+    __slots__ = ("lock", "out_time", "frame", "speed", "ended")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.out_time = 0.0
+        self.frame = 0
+        self.speed = 0.0
+        self.ended = False
+
+
+def parse_progress_time(key: str, value: str) -> float | None:
+    """
+    把 -progress 的时间字段统一成秒。
+
+    注意两点：
+      * ffmpeg 的 out_time_ms 历史上写的其实是微秒（和 out_time_us 同值），不是毫秒；
+      * 老版本 ffmpeg 只有 out_time=HH:MM:SS.ffffff，没有 out_time_us。
+    所以三种字段都要认，否则在"某些 ffmpeg 版本"下进度条会一直不动。
+    """
+    value = value.strip()
+    if key in ("out_time_us", "out_time_ms"):
+        if not value.isdigit():
+            return None            # 还没编出第一帧时是 N/A
+        return int(value) / 1_000_000
+    m = re.match(r"^(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$", value)
+    if not m:
+        return None
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+
+def _progress_reader(proc: subprocess.Popen, state: ProgressState) -> None:
+    """持续读 stdout（-progress 输出），主线程只负责画，永远不让管道写满。"""
+    try:
+        stream = proc.stdout
+        if stream is None:
+            return
+        for raw in stream:
+            line = raw.strip()
+            if not line or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            with state.lock:
+                if key in ("out_time_us", "out_time_ms", "out_time"):
+                    seconds = parse_progress_time(key, value)
+                    if seconds is not None and seconds > state.out_time:
+                        state.out_time = seconds
+                elif key == "frame" and value.isdigit():
+                    state.frame = int(value)
+                elif key == "speed" and value.endswith("x"):
+                    try:
+                        state.speed = float(value[:-1])
+                    except ValueError:
+                        pass
+                elif key == "progress" and value == "end":
+                    state.ended = True
+    except (ValueError, OSError):
+        pass
+
+
+def _stderr_reader(proc: subprocess.Popen, sink: deque, count: list) -> None:
+    """
+    把 stderr 读干净并留档。
+
+    这是进度条"卡死"的关键：ffmpeg 的警告写 stderr，如果父进程把 stderr 给了管道
+    却没人读，Windows 的管道缓冲区（64KB）写满后 ffmpeg 就阻塞在写日志上——
+    进程还在、视频却没继续编，进度自然一动不动。这里必须有专门的线程一直读。
+    """
+    try:
+        stream = proc.stderr
+        if stream is None:
+            return
+        for raw in stream:
+            line = raw.rstrip("\r\n")
+            if line.strip():
+                sink.append(line)
+                count[0] += 1
+    except (ValueError, OSError):
+        pass
+
+
+def _progress_text(done: float, duration: float, speed: float,
+                   stalled: bool, ended: bool) -> str:
+    width = 32
+    if duration > 0:
+        pct = max(0.0, min(1.0, done / duration))
+        filled = int(width * pct)
+        bar = "█" * filled + "░" * (width - filled)
+        if ended or pct >= 0.999:
+            tail = "收尾中…"
+            eta = 0.0
+        else:
+            eta = (duration - done) / speed if speed > 0 else -1
+            tail = f"剩余 {human_time(eta)}"
+        text = f"  {bar} {pct * 100:5.1f}%  {tail}  ({human_time(done)}/{human_time(duration)})"
+    else:
+        text = f"  已处理 {human_time(done)}  速度 {speed:.2f}x"
+    if stalled:
+        text += "  [等待 ffmpeg…]"
+    return text
+
+
+def _draw_progress(text: str) -> None:
+    sys.stdout.write("\r" + text + " " * 100)
+    sys.stdout.flush()
+
+
+def _report_ffmpeg_output(lines: deque, count: int, failed: bool, verbose: bool) -> None:
+    """把 ffmpeg 的警告/错误汇总给用户看，而不是让它们糊在进度条上。"""
+    if not lines:
+        return
+    cleaned = [clean_ffmpeg_line(ln) for ln in lines]
+    if failed:
+        log("")
+        warn(f"ffmpeg 日志（共 {count} 行），最后 12 行：")
+        for line in cleaned[-12:]:
+            log(f"  {line}")
+        return
+    if verbose:
+        log("")
+        info(f"ffmpeg 日志（共 {len(cleaned)} 行）：")
+        for line in cleaned:
+            log(f"  [ffmpeg] {line}")
+        return
+    # SVT-AV1 之类的外部编码库会把 [info] 直接写到 stderr，别当警告吓人
+    cleaned = [ln for ln in cleaned if "[info]" not in ln.lower()]
+    if not cleaned:
+        return
+    seen: set[str] = set()
+    unique: list[str] = []
+    for line in cleaned:
+        key = re.sub(r"\d+", "#", line)      # 数字归一化后再去重，DTS 警告只留一条
+        if key not in seen:
+            seen.add(key)
+            unique.append(line)
+    warn(f"ffmpeg 报告了 {len(cleaned)} 条警告（去重后 {len(unique)} 条）：")
+    for line in unique[:5]:
+        log(f"  {line}")
+    if len(unique) > 5:
+        log(f"  …还有 {len(unique) - 5} 条")
+
+
+def run_encode(cmd: list[str], duration: float, verbose: bool = False) -> int:
+    """
+    跑 ffmpeg，解析 -progress 画进度条。
+
+    相比 1.0：
+      * stdout / stderr 各一个读取线程 —— ffmpeg 刷多少警告都不会把管道写满卡死；
+      * out_time_us 缺失时退回 out_time_ms / out_time —— 老版本 ffmpeg 也能出进度；
+      * 长时间没有新进度会标 [等待 ffmpeg…]，不会像死机；
+      * 结束后汇总警告，失败时打印真正的错误行。
+    """
     tty = sys.stdout.isatty()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None,
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace", bufsize=1)
+    state = ProgressState()
+    err_lines: deque = deque(maxlen=500)
+    err_count = [0]
+    threads = [threading.Thread(target=_progress_reader, args=(proc, state), daemon=True),
+               threading.Thread(target=_stderr_reader, args=(proc, err_lines, err_count), daemon=True)]
+    for thread in threads:
+        thread.start()
+
     start = time.time()
+    last_done = -1.0
+    last_change = start
+    last_draw = 0.0
     last_report = 0.0
     try:
-        if proc.stdout is not None:
-            for line in proc.stdout:
-                key, _, value = line.strip().partition("=")
-                if key == "out_time_us" and value.strip().isdigit() and duration > 0:
-                    done = int(value) / 1_000_000
+        while proc.poll() is None:
+            now = time.time()
+            with state.lock:
+                done, speed, ended = state.out_time, state.speed, state.ended
+            if speed <= 0 and done > 0:
+                speed = done / max(0.001, now - start)   # 老版 ffmpeg 没有 speed 字段
+            if done > last_done + 1e-4:
+                last_done, last_change = done, now
+            stalled = not ended and (now - last_change) > 8.0
+            if tty:
+                if now - last_draw >= 0.25:
+                    last_draw = now
+                    _draw_progress(_progress_text(done, duration, speed, stalled, ended))
+            elif now - last_report >= 5.0:
+                last_report = now
+                if duration > 0:
                     pct = max(0.0, min(1.0, done / duration))
-                    speed = done / max(0.001, time.time() - start)
-                    eta = (duration - done) / speed if speed > 0 else -1
-                    if tty:
-                        width = 32
-                        filled = int(width * pct)
-                        bar = "█" * filled + "░" * (width - filled)
-                        sys.stdout.write(f"\r  {bar} {pct * 100:5.1f}%  "
-                                         f"剩余 {human_time(eta)}  ({human_time(done)}/{human_time(duration)})")
-                        sys.stdout.flush()
-                    elif time.time() - last_report > 5:
-                        last_report = time.time()
-                        log(f"  进度 {pct * 100:5.1f}%  剩余 {human_time(eta)}")
-                elif key == "progress" and value.strip() == "end":
-                    break
+                    if ended or pct >= 0.999:
+                        tail = "收尾中…"
+                    else:
+                        eta = (duration - done) / speed if speed > 0 else -1
+                        tail = f"剩余 {human_time(eta)}"
+                    log(f"  进度 {pct * 100:5.1f}%  {tail}" + ("  [等待 ffmpeg…]" if stalled else ""))
+                else:
+                    log(f"  已处理 {human_time(done)}" + ("  [等待 ffmpeg…]" if stalled else ""))
+            time.sleep(0.15)
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
     finally:
         if tty:
-            sys.stdout.write("\r" + " " * 78 + "\r")
+            sys.stdout.write("\r" + " " * 100 + "\r")
             sys.stdout.flush()
         code = proc.wait()
+        for thread in threads:
+            thread.join(timeout=1.5)
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+
+    _report_ffmpeg_output(err_lines, err_count[0], failed=(code != 0), verbose=verbose)
     return code
 
 
-def verify_output(ffprobe: str, out_path: Path, src: Media) -> list[str]:
+def verify_output(ffprobe: str, out_path: Path, src: Media,
+                  hdr_expected: bool = False) -> list[str]:
     if not out_path.is_file() or out_path.stat().st_size == 0:
         return [f"输出文件不存在或为空: {out_path}"]
     try:
@@ -756,6 +1221,13 @@ def verify_output(ffprobe: str, out_path: Path, src: Media) -> list[str]:
         issues.append(f"分辨率变化: {src.width}x{src.height} -> {got.width}x{got.height}")
     if len(src.audio) != len(got.audio):
         issues.append(f"音轨数变化: {len(src.audio)} -> {len(got.audio)}")
+    if hdr_expected:
+        if got.depth < 10:
+            issues.append(f"HDR 输出成了 {got.depth}bit（{got.pix_fmt or '?'}），应为 10bit")
+        if got.color_transfer != src.color_transfer:
+            issues.append(f"HDR 传递特性丢失: {src.color_transfer or '?'} -> {got.color_transfer or '未标记'}")
+        if got.color_primaries != src.color_primaries:
+            issues.append(f"HDR 色域标记丢失: {src.color_primaries or '?'} -> {got.color_primaries or '未标记'}")
     return issues
 
 
@@ -877,6 +1349,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--overwrite", action="store_true", help="输出文件已存在时直接覆盖")
     ap.add_argument("--keep-temp", action="store_true", help="保留临时字幕文件")
     ap.add_argument("--dry-run", action="store_true", help="只打印 ffmpeg 命令，不执行")
+    ap.add_argument("--tonemap", action="store_true",
+                    help="HDR→SDR 色调映射（输出 BT.709 8bit，给普通屏幕看）")
+    ap.add_argument("--verbose", action="store_true", help="结束时打印完整的 ffmpeg 日志")
     ap.add_argument("--list", action="store_true", help="列出目录里的视频和字幕")
     ap.add_argument("--probe", action="store_true", help="环境自检")
     ap.add_argument("--no-pause", action="store_true", help="结束时不等待回车")
@@ -934,6 +1409,22 @@ def main(argv: list[str] | None = None) -> int:
     info(f"输入视频: {video.name}")
     log(f"        {src.width}x{src.height}  {src.fps:.3f} fps  {human_time(src.duration)}  "
         f"音轨 {len(src.audio)} 条" + (f"（{','.join(src.audio)}）" if src.audio else ""))
+    if src.hdr:
+        log(f"        {src.hdr}  {src.color_primaries or '?'}/{src.color_transfer}"
+            f"  {src.depth}bit" + ("  Dolby Vision（重编码会丢 DV 动态层）" if src.dovi else ""))
+
+    # ---------- HDR -> SDR ----------
+    tonemap_filters = ""
+    if args.tonemap:
+        if not src.hdr:
+            info("源不是 HDR，--tonemap 无效果，忽略")
+        else:
+            try:
+                tonemap_filters, method = pick_tonemap(ffmpeg)
+            except RuntimeError as e:
+                err(str(e))
+                return 2
+            info(f"HDR → SDR 色调映射: {method}")
 
     # ---------- 字幕 ----------
     if args.subtitle:
@@ -978,6 +1469,7 @@ def main(argv: list[str] | None = None) -> int:
     if not codecs:
         err("当前加速方案没有可用编码格式")
         return 2
+    hdr_kept = bool(src.hdr and not tonemap_filters)
     if args.codec:
         codec = args.codec
         if codec not in codecs:
@@ -987,12 +1479,22 @@ def main(argv: list[str] | None = None) -> int:
         codec = codecs[0]
     else:
         codec = "h264" if "h264" in codecs else codecs[0]
+        if hdr_kept and "h265" in codecs:
+            codec = "h265"                  # HDR 默认给 Main10，比 H.264 靠谱得多
         if interactive:
             log("选择编码格式：")
             for i, c in enumerate(codecs, 1):
                 log(f"  [{i}] {CODEC_LABEL[c]}")
             codec = codecs[ask_choice("编码格式", len(codecs), default=codecs.index(codec) + 1)]
-    info(f"编码格式: {CODEC_LABEL[codec]}")
+    info(f"编码格式: {CODEC_LABEL[codec]}"
+         + ("  Main10" if hdr_kept and codec in ("h265", "av1") else ""))
+    if hdr_kept:
+        if codec == "h264":
+            warn("H.264 10bit HDR 兼容性很差（很多电视/播放器不认 High10），建议 -c h265")
+        if src.dovi:
+            warn("源是 Dolby Vision：重编码后 DV 动态层会丢失，只保留 HDR10 基础层")
+        if codec == "h264" and accel in ("amd", "intel"):
+            warn(f"{VENDOR_LABEL[accel]} 的 H.264 编码器不支持 10bit，硬件链路大概率回退 CPU")
 
     # ---------- 画质 ----------
     dq = default_quality_for(codec, accel)
@@ -1021,7 +1523,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # ---------- 组装方案 ----------
-    plan = build_plan(ffmpeg, accel, codec, quality)
+    plan = build_plan(ffmpeg, accel, codec, quality, src, tonemapped=bool(tonemap_filters))
     if args.preset and plan.accel == "cpu":
         if "-preset" in plan.enc_params:
             plan.enc_params[plan.enc_params.index("-preset") + 1] = args.preset
@@ -1039,7 +1541,7 @@ def main(argv: list[str] | None = None) -> int:
             info(f"字体目录: {fonts_dir}")
 
         cmd = build_ffmpeg_cmd(ffmpeg, plan, src, sub_tmp, out_path, fonts_dir,
-                               args.threads, "warning")
+                               args.threads, "warning", tonemap_filters)
         log("")
         log("=" * 68)
         log(f"  输入    : {video}")
@@ -1048,6 +1550,9 @@ def main(argv: list[str] | None = None) -> int:
         log(f"  加速方案: {VENDOR_LABEL[plan.accel]} / {plan.encoder}")
         log(f"  编码参数: {' '.join(plan.enc_params)}")
         log(f"  滤镜链  : {plan.filters}")
+        if src.hdr:
+            log("  HDR     : " + (f"保留 {src.hdr}（{plan.pix_fmt}）" if plan.hdr
+                                  else "已色调映射为 SDR（BT.709 8bit）"))
         log("=" * 68)
 
         if args.dry_run:
@@ -1057,15 +1562,16 @@ def main(argv: list[str] | None = None) -> int:
 
         if plan.accel != "cpu":
             log("正在试跑 0.5 秒验证硬件链路...")
-            good, why = validate_chain(ffmpeg, plan, src, sub_tmp, fonts_dir)
+            good, why = validate_chain(ffmpeg, plan, src, sub_tmp, fonts_dir, tonemap_filters)
             if good:
                 ok("硬件链路正常")
             else:
                 warn(f"硬件链路跑不通（{why}）")
                 warn("已自动回退 CPU 软编码")
-                plan = build_plan(ffmpeg, "cpu", codec, default_quality_for(codec, "cpu"))
+                plan = build_plan(ffmpeg, "cpu", codec, default_quality_for(codec, "cpu"),
+                                  src, tonemapped=bool(tonemap_filters))
                 cmd = build_ffmpeg_cmd(ffmpeg, plan, src, sub_tmp, out_path, fonts_dir,
-                                       args.threads, "warning")
+                                       args.threads, "warning", tonemap_filters)
                 log(f"  改用: {plan.encoder} {' '.join(plan.enc_params)}")
 
         if not args.yes and sys.stdin.isatty() and not ask_yes("确认开始压制？"):
@@ -1074,7 +1580,7 @@ def main(argv: list[str] | None = None) -> int:
 
         log("开始压制，按 Ctrl+C 可中断...")
         t0 = time.time()
-        code = run_encode(cmd, src.duration)
+        code = run_encode(cmd, src.duration, verbose=args.verbose)
         if code != 0:
             err(f"ffmpeg 退出码 {code}，压制失败")
             return code
@@ -1084,11 +1590,12 @@ def main(argv: list[str] | None = None) -> int:
         used = f"{elapsed:.1f} 秒" if elapsed < 60 else human_time(elapsed)
         log("")
         ok(f"压制完成: {out_path.name}   体积 {size_mb:.1f} MB   耗时 {used}")
-        issues = verify_output(ffprobe, out_path, src)
+        issues = verify_output(ffprobe, out_path, src, hdr_expected=plan.hdr)
         for it in issues:
             warn(it)
         if not issues:
-            ok("自检通过：时长 / 分辨率 / 音轨数全部一致")
+            extra = " / HDR 元数据" if plan.hdr else ""
+            ok(f"自检通过：时长 / 分辨率 / 音轨数{extra}全部一致")
         return 0
     finally:
         if args.keep_temp:

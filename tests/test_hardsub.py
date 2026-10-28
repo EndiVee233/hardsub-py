@@ -7,9 +7,10 @@ hardsub.py 的自动化测试。
     python tests\\test_hardsub.py -v
 
 需要本机有 ffmpeg / ffprobe（优先用 hardsub 自带目录里的）。
-最关键的回归测试是 test_first_subtitle_is_burned：
-旧的 bat / 直接调 ffmpeg 时，事件数较多的 ASS 会被 libass 吞掉第一条字幕，
-这里通过逐帧统计画面亮度来断言"视频开头真的有字幕"。
+最关键的回归测试：
+  * test_first_subtitle_is_burned：事件数较多的 ASS 不会被 libass 吞掉第一条字幕；
+  * TestHdrHelpers / test_hdr_*：HDR 必须保持 10bit + BT.2020/PQ 标签，--tonemap 输出 bt709；
+  * TestProgress：ffmpeg 狂刷警告时 stderr 必须被读干净（否则管道写满、进度条卡死）。
 """
 
 from __future__ import annotations
@@ -42,6 +43,20 @@ def make_video(path: Path, seconds: float = 2.0, size: str = "640x360") -> None:
            "-f", "lavfi", "-i", f"color=c=black:s={size}:r=25:d={seconds}",
            "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "64k", str(path)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def make_hdr_video(path: Path, seconds: float = 2.0, size: str = "320x180") -> None:
+    """造一个 10bit、BT.2020 / PQ 的 HDR 测试视频（黑底，方便统计字幕像素）。"""
+    cmd = [FFMPEG, "-y", "-v", "error",
+           "-f", "lavfi", "-i", f"color=c=black:s={size}:r=25:d={seconds}",
+           "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+           "-vf", "format=yuv420p10le,"
+                  "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+           "-c:v", "libx265", "-x265-params", "log-level=error",
+           "-pix_fmt", "yuv420p10le",
+           "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
            "-c:a", "aac", "-b:a", "64k", str(path)]
     subprocess.run(cmd, check=True, capture_output=True)
 
@@ -220,6 +235,150 @@ class TestPureFunctions(unittest.TestCase):
             self.assertEqual(sorted(s.name for s in subs), ["c.ass", "e.SRT"])
 
 
+class TestHdrHelpers(unittest.TestCase):
+    """HDR 相关纯函数（不调 ffmpeg 的部分）。"""
+
+    def test_pix_fmt_depth(self):
+        cases = {"yuv420p": 8, "nv12": 8, "yuv420p10le": 10, "p010le": 10,
+                 "yuv444p12le": 12, "gray": 8, "": 8}
+        for fmt, depth in cases.items():
+            self.assertEqual(hardsub.pix_fmt_depth(fmt), depth, fmt)
+
+    def test_clean_tag(self):
+        self.assertEqual(hardsub.clean_tag("bt2020"), "bt2020")
+        self.assertEqual(hardsub.clean_tag("unknown"), "")
+        self.assertEqual(hardsub.clean_tag("reserved"), "")
+        self.assertEqual(hardsub.clean_tag(None), "")
+
+    def test_hdr_filter_chain_cpu_keeps_10bit(self):
+        chain = hardsub.build_filters("subtitles='x.ass'", "cpu", "yuv420p10le")
+        self.assertTrue(chain.endswith("format=yuv420p10le"))
+        self.assertNotIn("hwdownload", chain)
+
+    def test_hdr_filter_chain_hw_downloads_p010(self):
+        chain = hardsub.build_filters("subtitles='x.ass'", "nvidia", "p010le", "", "p010le")
+        self.assertIn("hwdownload,format=p010le", chain)
+        self.assertNotIn("nv12", chain)
+        self.assertIn("hwupload_cuda", chain)
+
+    def test_sdr_filter_chain_hw_uses_nv12(self):
+        chain = hardsub.build_filters("subtitles='x.ass'", "nvidia", "nv12", "", "nv12")
+        self.assertIn("format=nv12", chain)
+
+    def test_tonemap_runs_before_subtitles(self):
+        """字幕必须在 tonemap 之后烧，否则字幕会被一起压暗。"""
+        chain = hardsub.build_filters("subtitles='x.ass'", "nvidia", "nv12",
+                                      hardsub.TONEMAP_ZSCALE, "p010le")
+        self.assertTrue(chain.startswith("hwdownload,format=p010le,zscale="))
+        self.assertLess(chain.index("tonemap=tonemap=hable"), chain.index("subtitles="))
+
+    def test_color_opts(self):
+        media = hardsub.Media(path=Path("x"), color_primaries="bt2020",
+                              color_transfer="smpte2084", color_space="bt2020nc")
+        hdr_opts = hardsub.color_opts_for(media, True, False)
+        self.assertIn("bt2020", hdr_opts)
+        self.assertIn("smpte2084", hdr_opts)
+        self.assertIn("bt2020nc", hdr_opts)
+        sdr_opts = hardsub.color_opts_for(None, False, True)
+        self.assertIn("bt709", sdr_opts)
+        self.assertEqual(hardsub.color_opts_for(None, False, False), [])
+
+    def test_master_display_param(self):
+        side = {"red_x": "34000/50000", "red_y": "16000/50000",
+                "green_x": "13250/50000", "green_y": "34500/50000",
+                "blue_x": "7500/50000", "blue_y": "3000/50000",
+                "white_point_x": "15635/50000", "white_point_y": "16450/50000",
+                "min_luminance": "50/10000", "max_luminance": "10000000/10000"}
+        self.assertEqual(
+            hardsub.master_display_param(side),
+            "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)")
+        self.assertEqual(hardsub.master_display_param({}), "")
+
+    @unittest.skipIf(not FFMPEG, "本机没有 ffmpeg")
+    def test_plan_hdr(self):
+        media = hardsub.Media(path=Path("x"), depth=10, hdr="HDR10（PQ）",
+                              color_primaries="bt2020", color_transfer="smpte2084",
+                              color_space="bt2020nc")
+        plan = hardsub.build_plan(FFMPEG, "cpu", "h265", 23, media)
+        self.assertTrue(plan.hdr)
+        self.assertEqual(plan.pix_fmt, "yuv420p10le")
+        self.assertIn("-x265-params", plan.enc_params)
+        self.assertTrue(any("hdr-opt=1" in p for p in plan.enc_params))
+
+        if hardsub.encoder_available(FFMPEG, "hevc_nvenc"):
+            hw = hardsub.build_plan(FFMPEG, "nvidia", "h265", 23, media)
+            self.assertEqual(hw.pix_fmt, "p010le")
+            self.assertEqual(hw.hw_pix_fmt, "p010le")
+            self.assertIn("main10", hw.enc_params)
+
+        sdr = hardsub.build_plan(FFMPEG, "cpu", "h265", 23, media, tonemapped=True)
+        self.assertFalse(sdr.hdr)
+        self.assertEqual(sdr.pix_fmt, "yuv420p")
+        self.assertIn("bt709", sdr.color_opts)
+
+
+class TestProgress(unittest.TestCase):
+    """进度解析 + stderr 处理（对应'视频在编、进度条不动'的 bug）。"""
+
+    def test_parse_progress_time(self):
+        self.assertAlmostEqual(hardsub.parse_progress_time("out_time_us", "1500000"), 1.5)
+        # out_time_ms 在 ffmpeg 里其实也是微秒（历史遗留），按微秒算才对
+        self.assertAlmostEqual(hardsub.parse_progress_time("out_time_ms", "1500000"), 1.5)
+        self.assertAlmostEqual(hardsub.parse_progress_time("out_time", "00:01:02.500000"), 62.5)
+        self.assertAlmostEqual(hardsub.parse_progress_time("out_time", "01:00:00.000000"), 3600.0)
+        self.assertIsNone(hardsub.parse_progress_time("out_time_us", "N/A"))
+        self.assertIsNone(hardsub.parse_progress_time("out_time", "N/A"))
+
+    def test_pick_error_line_prefers_root_cause(self):
+        stderr = ("[out#0/null @ 0x1] Nothing was written into output file, because...\n"
+                  "[hwdownload @ 0x2] Invalid output format nv12 for hwframe download.\n")
+        self.assertIn("Invalid output format nv12", hardsub.pick_error_line(stderr))
+
+    def test_run_encode_drains_stderr(self):
+        """
+        旧实现把 stderr 直接继承/不读：ffmpeg 警告一多，管道写满就卡死，
+        表现正好是"视频还在压、进度条不动"。这里让子进程狂写 20000 行警告。
+        """
+        script = (
+            "import os, sys, threading\n"
+            "_t = threading.Timer(30, lambda: os._exit(9))\n"
+            "_t.daemon = True\n"
+            "_t.start()\n"
+            "for i in range(20000):\n"
+            "    sys.stderr.write('warning line %d\\n' % i)\n"
+            "sys.stderr.flush()\n"
+            "for i in range(1, 11):\n"
+            "    sys.stdout.write('out_time_us=%d\\n' % (i * 1000000))\n"
+            "    sys.stdout.write('progress=continue\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.stdout.write('out_time_us=10000000\\nprogress=end\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        code = hardsub.run_encode([sys.executable, "-c", script], 10.0)
+        self.assertEqual(code, 0)
+
+    def test_run_encode_reports_warnings(self):
+        script = ("import sys\n"
+                  "sys.stderr.write('[x @ 0x1] something odd happened\\n')\n"
+                  "sys.stdout.write('progress=end\\n')\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = hardsub.run_encode([sys.executable, "-c", script], 10.0)
+        self.assertEqual(code, 0)
+        self.assertIn("something odd happened", buf.getvalue())
+
+    def test_run_encode_shows_failure_detail(self):
+        script = ("import sys\n"
+                  "sys.stdout.write('progress=end\\n')\n"
+                  "sys.stderr.write('[dec @ 0x1] Invalid data found when processing input\\n')\n"
+                  "sys.exit(3)\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = hardsub.run_encode([sys.executable, "-c", script], 10.0)
+        self.assertEqual(code, 3)
+        self.assertIn("Invalid data found", buf.getvalue())
+
+
 # --------------------------------------------------------------------------
 # 集成测试（真的调 ffmpeg）
 # --------------------------------------------------------------------------
@@ -232,6 +391,8 @@ class TestIntegration(unittest.TestCase):
         make_video(cls.d / "video.mp4")
         make_ass(cls.d / "sub.ass", 60)
         make_srt(cls.d / "sub.srt", 60)
+        make_hdr_video(cls.d / "hdr.mp4")
+        make_ass(cls.d / "hdr.ass", 10)
 
     @classmethod
     def tearDownClass(cls):
@@ -284,6 +445,50 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(len(got.audio), len(src.audio))
         self.assertAlmostEqual(got.duration, src.duration, delta=0.5)
         self.assertEqual((got.width, got.height), (src.width, src.height))
+
+    def test_hdr_video_keeps_10bit_and_tags(self):
+        """HDR 源必须输出 10bit + BT.2020/PQ 标签，且字幕正常烧进去。"""
+        out = self.d / "out_hdr.mp4"
+        code, txt = run_main(["-d", str(self.d), "-v", "hdr.mp4", "-s", "hdr.ass",
+                              "-a", "cpu", "-c", "h265", "-y", "-o", str(out), "--overwrite"])
+        self.assertEqual(code, 0, txt)
+        src = hardsub.ffprobe_media(FFPROBE, self.d / "hdr.mp4")
+        got = hardsub.ffprobe_media(FFPROBE, out)
+        self.assertEqual(src.hdr, "HDR10（PQ）")
+        self.assertEqual(got.depth, 10)
+        self.assertEqual(got.color_transfer, src.color_transfer)
+        self.assertEqual(got.color_primaries, src.color_primaries)
+        self.assertGreater(brightness_at(out, 0.04, size="320x180"), 5)
+
+    def test_hdr_tonemap_to_sdr(self):
+        """--tonemap 必须输出 BT.709 8bit，字幕照样在。"""
+        if not {"zscale", "tonemap"} <= hardsub.list_filters(FFMPEG):
+            self.skipTest("ffmpeg 没有 zscale/tonemap")
+        out = self.d / "out_hdr_sdr.mp4"
+        code, txt = run_main(["-d", str(self.d), "-v", "hdr.mp4", "-s", "hdr.ass",
+                              "-a", "cpu", "-c", "h265", "--tonemap", "-y",
+                              "-o", str(out), "--overwrite"])
+        self.assertEqual(code, 0, txt)
+        got = hardsub.ffprobe_media(FFPROBE, out)
+        self.assertEqual(got.depth, 8)
+        self.assertEqual(got.color_transfer, "bt709")
+        self.assertGreater(brightness_at(out, 0.04, size="320x180"), 5)
+
+    def test_hdr_hardware_path(self):
+        """有硬件时，HDR 也必须走硬件链路成功（旧的 nv12 链会直接报错回退 CPU）。"""
+        accels = [a for a in hardsub.usable_accels(FFMPEG, hardsub.detect_gpus()) if a != "cpu"]
+        if not accels:
+            self.skipTest("本机没有硬件编码")
+        for accel in accels:
+            if "h265" not in hardsub.acceler_encoders(FFMPEG, accel):
+                continue
+            out = self.d / f"out_hdr_{accel}.mp4"
+            code, txt = run_main(["-d", str(self.d), "-v", "hdr.mp4", "-s", "hdr.ass",
+                                  "-a", accel, "-c", "h265", "-y", "-o", str(out),
+                                  "--overwrite"])
+            self.assertEqual(code, 0, txt)
+            got = hardsub.ffprobe_media(FFPROBE, out)
+            self.assertEqual(got.depth, 10, txt)
 
     def test_unicode_space_path(self):
         sub_dir = self.d / "中文 目录"
