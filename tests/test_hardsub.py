@@ -115,6 +115,15 @@ def brightness_at(video: Path, seconds: float, size: str = "640x360") -> int:
     return sum(1 for b in res.stdout if b > 150)
 
 
+def max_luma10(video: Path, seconds: float, size: str = "320x180") -> int:
+    """取一帧 10bit Y 平面里最亮的码值（用于核对 HDR 字幕白是不是 203nit）。"""
+    w, h = (int(x) for x in size.split("x"))
+    cmd = [FFMPEG, "-v", "error", "-ss", str(seconds), "-i", str(video), "-frames:v", "1",
+           "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-"]
+    raw = subprocess.run(cmd, capture_output=True).stdout
+    return max(int.from_bytes(raw[i:i + 2], "little") for i in range(0, w * h * 2, 2))
+
+
 def run_main(args: list[str]) -> tuple[int, str]:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -317,6 +326,110 @@ class TestHdrHelpers(unittest.TestCase):
         self.assertIn("bt709", sdr.color_opts)
 
 
+class TestHdrSubtitleColor(unittest.TestCase):
+    """HDR 字幕配色：SDR 白必须映射成 203nit，而不是 PQ 峰值附近的 9900nit。"""
+
+    def test_pq_white_maps_to_203nit_code(self):
+        # 203nit 的 PQ 信号 ≈ 0.58 -> 148/255，实测烧进视频后约 201nit
+        self.assertEqual(hardsub.map_sdr_color_to_hdr((255, 255, 255), "smpte2084"),
+                         (148, 148, 148))
+
+    def test_hlg_white_maps_to_75_percent_signal(self):
+        # HLG 0.75 信号 = 1000nit 屏上的 203nit
+        self.assertEqual(hardsub.map_sdr_color_to_hdr((255, 255, 255), "arib-std-b67"),
+                         (191, 191, 191))
+
+    def test_black_stays_black(self):
+        for transfer in ("smpte2084", "arib-std-b67"):
+            self.assertEqual(hardsub.map_sdr_color_to_hdr((0, 0, 0), transfer), (0, 0, 0))
+
+    def test_color_mapping_is_not_identity_but_keeps_channels_distinct(self):
+        rgb = hardsub.map_sdr_color_to_hdr((255, 0, 0), "smpte2084")
+        self.assertNotEqual(rgb, (255, 0, 0))
+        self.assertGreater(rgb[0], rgb[1])
+        self.assertGreater(rgb[1], rgb[2])
+
+    def test_ass_color_parse_and_format(self):
+        self.assertEqual(hardsub.parse_ass_color("&H00FFFFFF"),
+                         (255, 255, 255, 0, 8))
+        self.assertEqual(hardsub.parse_ass_color("&H0000FF"),
+                         (255, 0, 0, 0, 6))
+        self.assertEqual(hardsub.parse_ass_color("&H80000000"),
+                         (0, 0, 0, 0x80, 8))
+        self.assertEqual(hardsub.format_ass_color((148, 148, 148), 0, 8), "&H00949494")
+        self.assertEqual(hardsub.format_ass_color((148, 148, 148), 0, 6), "&H949494")
+        self.assertIsNone(hardsub.parse_ass_color("not-a-color"))
+
+    def test_remap_ass_colors_style_and_inline_overrides(self):
+        text = "\n".join([
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+            "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+            "MarginL, MarginR, MarginV, Encoding",
+            "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+            "0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            r"Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,{\c&HFFFFFF&}white "
+            r"{\1c&H0000FF&}red",
+        ])
+        out, changed = hardsub.remap_ass_colors(text, "smpte2084")
+        self.assertGreaterEqual(changed, 3)
+        self.assertIn("&H00949494", out)                 # 主色白
+        self.assertIn("&H80000000", out)                 # 半透明黑背板保持不变
+        self.assertIn(r"{\c&H949494&}", out)             # 内联白
+        self.assertIn(r"{\1c&H385388&}", out)            # 内联红（BGR 顺序）
+        self.assertIn("&H00385388", out)                 # 样式里的红色副色也映射了
+
+    def test_sdr_subtitle_is_not_remapped(self):
+        text = "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000," \
+               "0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1"
+        out, changed = hardsub.remap_ass_colors(text, "")
+        self.assertEqual(changed, 0)
+        self.assertEqual(out, text)
+
+    def test_srt_force_style_uses_hdr_white(self):
+        style = hardsub.hdr_sub_force_style("smpte2084")
+        self.assertIn("PrimaryColour=&H00949494", style)
+        self.assertIn("OutlineColour=&H00000000", style)
+        hlg = hardsub.hdr_sub_force_style("arib-std-b67")
+        self.assertIn("PrimaryColour=&H00BFBFBF", hlg)
+
+    def test_sub_filter_opts_adds_force_style_only_when_given(self):
+        plain = hardsub.sub_filter_opts(Path("x.srt"), None)
+        self.assertNotIn("force_style", plain)
+        styled = hardsub.sub_filter_opts(Path("x.srt"), None,
+                                         hardsub.hdr_sub_force_style("smpte2084"))
+        self.assertIn("force_style='PrimaryColour=&H00949494", styled)
+
+    def test_prepare_subtitle_maps_colors_only_for_hdr(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "a.ass"
+            src.write_text(
+                "[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+                "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+                "MarginL, MarginR, MarginV, Encoding\n"
+                "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+                "0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n"
+                "\n[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+                "MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,hi\n",
+                encoding="utf-8")
+            plain, _ = hardsub.prepare_subtitle(src, Path(d))
+            self.assertIn("&H00FFFFFF", plain.read_text(encoding="utf-8"))
+            hdr, notes = hardsub.prepare_subtitle(src, Path(d), "smpte2084")
+            self.assertIn("&H00949494", hdr.read_text(encoding="utf-8"))
+            self.assertTrue(any("HDR" in n for n in notes))
+
+
 class TestProgress(unittest.TestCase):
     """进度解析 + stderr 处理（对应'视频在编、进度条不动'的 bug）。"""
 
@@ -458,7 +571,18 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(got.depth, 10)
         self.assertEqual(got.color_transfer, src.color_transfer)
         self.assertEqual(got.color_primaries, src.color_primaries)
-        self.assertGreater(brightness_at(out, 0.04, size="320x180"), 5)
+        # 字幕预映射后白字是 203nit（10bit Y≈572），不再是过曝的 939
+        self.assertGreater(max_luma10(out, 0.04), 500)
+
+    def test_hdr_subtitle_white_is_about_203nit(self):
+        """HDR 白字幕必须预映射到 203nit（10bit Y ≈ 572），而不是 PQ 峰值（≈939）。"""
+        out = self.d / "out_hdr_subcolor.mp4"
+        code, txt = run_main(["-d", str(self.d), "-v", "hdr.mp4", "-s", "hdr.ass",
+                              "-a", "cpu", "-c", "h265", "-y", "-o", str(out), "--overwrite"])
+        self.assertEqual(code, 0, txt)
+        y = max_luma10(out, 0.04)
+        self.assertGreater(y, 500, f"字幕白太暗（Y={y}）")
+        self.assertLess(y, 640, f"字幕白过曝了（Y={y}，未做 HDR 配色映射？）")
 
     def test_hdr_tonemap_to_sdr(self):
         """--tonemap 必须输出 BT.709 8bit，字幕照样在。"""

@@ -25,7 +25,7 @@
 | 硬件链路失败 → 白跑到一半报错 | 试跑失败自动回退 CPU，并告诉你原因 |
 | CPU 路径也带 `hwdownload`，软解时可能直接报错 | CPU 路径干净，不依赖硬件帧 |
 | `libsvtav1` 配 `-preset medium` → 必报错 | 按编码器给正确参数 |
-| **HDR 视频** 被压成 8bit，或硬件链路直接报 `Invalid output format nv12 for hwframe download` | 自动识别 HDR10 / HLG，全程 10bit（`yuv420p10le` / `p010le`），写回 BT.2020 + PQ/HLG 标签和 HDR10 静态元数据；`--tonemap` 可转 SDR |
+| **HDR 视频** 被压成 8bit，或硬件链路直接报 `Invalid output format nv12 for hwframe download` | 自动识别 HDR10 / HLG，全程 10bit（`yuv420p10le` / `p010le`），写回 BT.2020 + PQ/HLG 标签和 HDR10 静态元数据；HDR 源静默走 HDR 链路，普通源走普通链路；字幕颜色按 203nit 预映射，不会白得刺眼；`--tonemap` 可转 SDR |
 | 进度条在有些情况下不动（ffmpeg 警告塞满 stderr 管道 / 旧版 ffmpeg 没有 `out_time_us`） | stdout、stderr 各一个读取线程；进度字段三级回退；长时间没进度会提示 `[等待 ffmpeg…]`；结束时汇总警告 |
 | 没有进度、压完不知道对不对 | 进度条 + 压制后自检（时长 / 分辨率 / 音轨数 / HDR 元数据） |
 | 只能人工交互 | 全参数化，可脚本化调度 |
@@ -94,9 +94,11 @@ hardsub.exe -v HDR视频.mkv -s 字幕.ass --tonemap -y
 
 ## HDR 视频
 
-自动识别 `color_transfer = smpte2084`（HDR10 / PQ）和 `arib-std-b67`（HLG）。
+**静默自动处理**：程序按 `color_transfer` 识别 `smpte2084`（HDR10 / PQ）和
+`arib-std-b67`（HLG）。HDR 源自动走 10bit HDR 链路，普通源走原来的 SDR 链路，
+不需要加参数，也不会弹选项问"要不要按 HDR 处理"。
 
-**默认保留 HDR**，不会偷偷转成 SDR：
+HDR 链路上做的事：
 
 - 滤镜链全程 10bit：CPU 是 `yuv420p10le`，硬件是 `p010le`（旧版写死 `nv12`，
   10bit 源上 `hwdownload` 会直接报 `Invalid output format nv12 for hwframe download`，
@@ -107,17 +109,38 @@ hardsub.exe -v HDR视频.mkv -s 字幕.ass --tonemap -y
   硬件编码器则由帧的 side data 把 Mastering display / MaxCLL 带进码流；
 - 压制后自检会核对输出是不是 10bit、色彩标签有没有丢。
 
+### HDR 下的字幕亮度
+
+字幕原本是 SDR 的（BT.709，白 = 100nit）。直接把 SDR 白写进 PQ 视频，255 会被
+当成接近峰值的 PQ 信号——实测 10bit 白字约 **9900nit**，在黑场景里白得刺眼。
+
+HDR 链路会把字幕颜色**预映射**到 HDR 的码值，再交给 libass 正常烧录：
+
+| 传递特性 | SDR 白映射到 | 码值（8bit） | 实际亮度 |
+| --- | --- | --- | --- |
+| HDR10 / PQ | PQ 0.58 信号 | 148/255（`&H949494`） | ≈203nit（BT.2408 图形白） |
+| HLG | 75% HLG 信号 | 191/255（`&HBFBFBF`） | 1000nit 屏上 ≈203nit |
+
+处理范围：
+
+- ASS/SSA：样式表里的 `PrimaryColour` / `SecondaryColour` / `OutlineColour` /
+  `BackColour`，以及事件里的内联 `\c`、`\1c`~`\4c`（含 `\t(...)` 里的颜色）都会换算；
+  透明度、字号、位置、渐变时序不变。
+- SRT/VTT：没有样式表，通过 `force_style` 把 libass 默认白/描边改成 HDR 码值。
+- 换算在线性光下做 BT.709 → BT.2020，再按 203nit 编码成 PQ 或 HLG；所以不是简单
+  把白改成灰色，彩色字幕的色相/亮度关系也保持正常。
+- 已知限制：SRT/VTT 内联的 `<font color="#...">` 不会被换算（会按 SDR 色显示得偏亮）；
+  需要精确配色的字幕请用 ASS/SSA。位图字幕（PGS/VobSub）本来就不在支持范围内。
+
 要在普通 SDR 屏幕上看，加 `--tonemap`：优先用 `zscale + tonemap(hable)`（纯 CPU），
 没有 libzimg 的 ffmpeg 会退到 `libplacebo`。字幕在 tonemap **之后**才烧，
-所以字幕是正常的 SDR 白色，不会被一起压暗。
+所以字幕是正常的 SDR 白色，不会被一起压暗；这种情况下不做 HDR 配色映射。
 
 几个注意点：
 
 - HDR + `-c h264`：H.264 10bit（High10）兼容性很差，硬件编码器也基本不支持，
   建议用 `-c h265`（程序在 HDR 下不指定编码时已经默认 h265）。
 - Dolby Vision 源：重编码后 DV 动态层会丢失，只保留 HDR10 基础层（程序会提示）。
-- HDR 下 libass 渲染的字幕是 SDR 白（在 PQ 里接近峰值亮度），会比画面亮不少；
-  这是 libass 的固有限制，介意的话请用 SDR 片源或 `--tonemap`。
 
 ## 进度条为什么不会卡住
 
@@ -133,7 +156,7 @@ ffmpeg 就卡在写日志上：进程还在、视频不再前进、进度条一�
 
 ```bash
 python hardsub.py --probe                     # 直接跑源码
-python tests\test_hardsub.py                  # 52 项单元 + 集成测试（含 HDR / 进度回归）
+python tests\test_hardsub.py                  # 63 项单元 + 集成测试（含 HDR 配色 / 进度回归）
 python tests\verify_exe.py                    # exe 黑盒验证（需先打包出 exe）
 
 # 打包成单文件 exe

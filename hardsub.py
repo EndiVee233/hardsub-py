@@ -18,7 +18,9 @@ hardsub.py — 智能硬编码(烧录)字幕 · 命令行版
   6. 全参数化命令行，可被其它脚本调度。
   7. HDR（HDR10 / HLG）全程 10bit，写回 BT.2020 + PQ/HLG 标签，保留 HDR10 静态元数据；
      硬件链路的 hwdownload/hwupload 按位深用 p010le，不再因为写死 nv12 而整条失败。
-     --tonemap 可以把 HDR 转成 SDR（BT.709 8bit）。
+     HDR 是静默自动识别的：HDR 源走 HDR 链路，普通源走 SDR 链路，不用加参数或做选择。
+     字幕颜色会按 BT.2408 图形白 203nit 预映射到 PQ/HLG（SDR 白在 PQ 里原本≈9900nit，
+     会白得刺眼），彩色内联覆盖也一起处理。--tonemap 仍可把 HDR 转成 SDR（BT.709 8bit）。
   8. 进度条不会再被 ffmpeg 的警告卡住：stdout/stderr 各一个读取线程，进度字段三级回退，
      结束时汇总警告、失败时打印真正的错误行。
 
@@ -34,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -46,7 +49,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".flv", ".webm", ".avi", ".m4v", ".ts",
               ".wmv", ".mpg", ".mpeg", ".rmvb")
@@ -75,6 +78,36 @@ MP4_OK_AUDIO = {"aac", "mp3", "ac2", "ac3", "eac3", "alac", "mp2", "opus", "dts"
 # HDR 的传递特性 -> 给人看的名字。HDR10 用 PQ，HLG 是广电那套。
 HDR_TRANSFERS = {"smpte2084": "HDR10（PQ）", "arib-std-b67": "HLG"}
 UNKNOWN_TAGS = {"", "unknown", "unspecified", "reserved", "n/a", "none"}
+
+# --------------------------------------------------------------------------
+# HDR 字幕配色
+# --------------------------------------------------------------------------
+# 问题：字幕是 SDR 的（BT.709，100% 白 = 100nit）。把这种白色直接烧进 PQ 视频，
+# 235 会被当成 PQ 的 0.92 信号 —— 实测白字 10bit 939（约 9900nit），在黑场景里
+# 白得刺眼，边缘还会发灰（实际是 HDR 过曝）。
+# 做法（最常见的"字幕颜色预映射"）：按 BT.2408 的图形白 203nit，把每个 SDR 颜色
+# 经线性光 BT.709 -> BT.2020 变换后，用目标传递特性重新编码成码值写回字幕：
+#   PQ  : 白 ≈ 148/255（0.58 信号 ≈ 203nit）
+#   HLG : 白 ≈ 191/255（0.75 信号，1000nit 屏上 ≈ 203nit）
+# 只改颜色（含 \c / \1c..\4c 内联覆盖），字号、位置、透明度、渐变时序都不动。
+# 这样 HDR 片源正常走 10bit HDR 链路，字幕亮度也和 SDR 下看起来一致。
+HDR_SUB_WHITE_NITS = 203.0       # BT.2408 图形白
+HDR_HLG_PEAK_NITS = 1000.0       # HLG 参考显示峰值
+HDR_HLG_GAMMA = 1.2              # BT.2100 系统 gamma
+
+# BT.709 -> BT.2020 线性光矩阵（D65 白点，行和 = 1，白色亮度不变）
+BT709_TO_BT2020 = (
+    (0.627403895934699, 0.329283038377883, 0.043313065687418),
+    (0.069097289358232, 0.919540395075459, 0.011362315566309),
+    (0.016391438875150, 0.088013307877226, 0.895595253247624),
+)
+
+# SMPTE ST 2084（PQ）常数
+PQ_M1, PQ_M2 = 0.1593017578125, 78.84375
+PQ_C1, PQ_C2, PQ_C3 = 0.8359375, 18.8515625, 18.6875
+
+# BT.2100 HLG OETF 常数
+HLG_A, HLG_B, HLG_C = 0.17883277, 0.28466892, 0.55991073
 
 
 # ==========================================================================
@@ -579,6 +612,177 @@ def read_text_any(path: Path) -> tuple[str, str]:
     return raw.decode("utf-8", errors="replace"), "utf-8(replace)"
 
 
+# --- HDR 字幕配色预映射 ---------------------------------------------------
+def _srgb_to_linear(code: float) -> float:
+    """8bit sRGB 码值 -> 线性光（0..1）。"""
+    v = max(0.0, min(255.0, float(code))) / 255.0
+    return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+
+def _pq_signal(nits: float) -> float:
+    """绝对亮度 -> PQ 信号（0..1，10000nit 为 1）。"""
+    y = max(0.0, float(nits)) / 10000.0
+    ym = y ** PQ_M1
+    return ((PQ_C1 + PQ_C2 * ym) / (1.0 + PQ_C3 * ym)) ** PQ_M2
+
+
+def _hlg_signal(nits: float) -> float:
+    """显示亮度 -> HLG 信号（0..1，参考 1000nit 峰值）。"""
+    e = (max(0.0, float(nits)) / HDR_HLG_PEAK_NITS) ** (1.0 / HDR_HLG_GAMMA)
+    if e <= 1.0 / 12.0:
+        return math.sqrt(3.0 * e)
+    return HLG_A * math.log(12.0 * e - HLG_B) + HLG_C
+
+
+_HDR_COLOR_CACHE: dict[tuple[int, int, int, str], tuple[int, int, int]] = {}
+
+
+def map_sdr_color_to_hdr(rgb: tuple[int, int, int], transfer: str) -> tuple[int, int, int]:
+    """
+    把一个 SDR 字幕颜色（BT.709 / sRGB）映射成 HDR 视频里该用的码值。
+
+    线性光下 709 -> 2020 换色域，再按 203nit 图形白编码成 PQ 或 HLG 信号。
+    白色在 PQ 下是 148、HLG 下是 191；黑色仍是 0，中间色按亮度比例变化。
+    """
+    key = (int(rgb[0]), int(rgb[1]), int(rgb[2]), transfer)
+    cached = _HDR_COLOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    lin = [_srgb_to_linear(c) for c in key[:3]]
+    out: list[int] = []
+    for row in BT709_TO_BT2020:
+        value = row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2]
+        nits = max(0.0, value) * HDR_SUB_WHITE_NITS
+        signal = _pq_signal(nits) if transfer != "arib-std-b67" else _hlg_signal(nits)
+        out.append(max(0, min(255, int(round(signal * 255.0)))))
+    result = (out[0], out[1], out[2])
+    _HDR_COLOR_CACHE[key] = result
+    return result
+
+
+_ASS_COLOR_RE = re.compile(r"^&[Hh]([0-9A-Fa-f]{1,8})$")
+
+
+def parse_ass_color(value: str) -> tuple[int, int, int, int, int] | None:
+    """
+    解析 ASS/SSA 颜色，返回 (r, g, b, a, 位宽)。
+    ASS 是 &HAABBGGRR（6 位时省略 AA），老 SSA 也可能是十进制。
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    m = _ASS_COLOR_RE.match(text)
+    if m:
+        digits = m.group(1)
+        number = int(digits, 16)
+        width = 8 if len(digits) > 6 else 6
+    elif text.isdigit():
+        number = int(text, 10)
+        width = 8
+    else:
+        return None
+    a = (number >> 24) & 0xFF if width == 8 else 0
+    b = (number >> 16) & 0xFF
+    g = (number >> 8) & 0xFF
+    r = number & 0xFF
+    return r, g, b, a, width
+
+
+def format_ass_color(rgb: tuple[int, int, int], alpha: int, width: int) -> str:
+    r, g, b = rgb
+    if width == 6:
+        return f"&H{b:02X}{g:02X}{r:02X}"
+    return f"&H{alpha:02X}{b:02X}{g:02X}{r:02X}"
+
+
+_HDR_INLINE_COLOR_RE = re.compile(r"\\([1-4]?[cC])&[Hh]([0-9A-Fa-f]{1,8})(&?)")
+
+
+def remap_ass_colors(text: str, transfer: str) -> tuple[str, int]:
+    """
+    把 ASS/SSA 里所有 SDR 颜色改成 HDR 码值：样式表 4 个颜色 + 内联 \\c/\\1c..\\4c。
+    返回 (新文本, 改动处数)。事件文本里的内联覆盖也一并处理，避免彩色字幕过曝。
+    """
+    lines = text.splitlines()
+    newline = "\r\n" if "\r\n" in text else "\n"
+    changed = 0
+    in_styles = False
+    fields: list[str] | None = None
+    default_fields = ["name", "fontname", "fontsize", "primarycolour", "secondarycolour",
+                      "outlinecolour", "backcolour", "bold", "italic", "underline",
+                      "strikeout", "scalex", "scaley", "spacing", "angle", "borderstyle",
+                      "outline", "shadow", "alignment", "marginl", "marginr", "marginv",
+                      "encoding"]
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        low = stripped.lower()
+        if low.startswith("[") and low.endswith("]"):
+            in_styles = low in ("[v4+ styles]", "[v4 styles]", "[v4++ styles]")
+            fields = None
+            continue
+
+        if in_styles:
+            if low.startswith("format:"):
+                fields = [p.strip().lower() for p in stripped.split(":", 1)[1].split(",")]
+                continue
+            if low.startswith("style:"):
+                body = stripped.split(":", 1)[1]
+                use_fields = fields or default_fields
+                parts = body.split(",", len(use_fields) - 1)
+                if len(parts) == len(use_fields):
+                    touched = False
+                    for key in ("primarycolour", "secondarycolour", "outlinecolour",
+                                "tertiarycolour", "backcolour"):
+                        if key not in use_fields:
+                            continue
+                        idx = use_fields.index(key)
+                        parsed = parse_ass_color(parts[idx])
+                        if parsed is None:
+                            continue
+                        r, g, b, a, width = parsed
+                        mapped = map_sdr_color_to_hdr((r, g, b), transfer)
+                        if mapped != (r, g, b):
+                            parts[idx] = format_ass_color(mapped, a, width)
+                            touched = True
+                    if touched:
+                        lines[i] = line[:len(line) - len(line.lstrip())] + "Style:" + ",".join(parts)
+                        changed += 1
+                continue
+
+        if low.startswith(("dialogue:", "comment:")):
+            def repl(match: re.Match[str]) -> str:
+                prefix, digits, tail = match.group(1), match.group(2), match.group(3)
+                width = 8 if len(digits) > 6 else 6
+                number = int(digits, 16)
+                a = (number >> 24) & 0xFF if width == 8 else 0
+                b = (number >> 16) & 0xFF
+                g = (number >> 8) & 0xFF
+                r = number & 0xFF
+                nr, ng, nb = map_sdr_color_to_hdr((r, g, b), transfer)
+                digits_out = (f"{a:02X}{nb:02X}{ng:02X}{nr:02X}" if width == 8
+                              else f"{nb:02X}{ng:02X}{nr:02X}")
+                return f"\\{prefix}&H{digits_out}{tail}"
+
+            new_line, count = _HDR_INLINE_COLOR_RE.subn(repl, line)
+            if count:
+                lines[i] = new_line
+                changed += count
+
+    return newline.join(lines), changed
+
+
+def hdr_sub_force_style(transfer: str) -> str:
+    """
+    SRT/VTT 没有样式表，libass 会用默认白色。给 subtitles 滤镜传 force_style，
+    把默认白/描边改写成 HDR 码值（只影响默认样式，不碰字号/位置）。
+    """
+    white = map_sdr_color_to_hdr((255, 255, 255), transfer)
+    value = f"&H00{white[2]:02X}{white[1]:02X}{white[0]:02X}"
+    return (f"PrimaryColour={value},SecondaryColour={value},"
+            "OutlineColour=&H00000000,BackColour=&H00000000")
+
+
 # --- 首条字幕保护 ---------------------------------------------------------
 # 现象：ffmpeg 的 subtitles 滤镜读 ASS 时，如果文件里事件数较多（实测 >50 条），
 #       会把【文件中的第一条事件】丢掉不渲染 —— 视频开头的第一条字幕就没了。
@@ -656,11 +860,14 @@ def inject_sacrificial_cue(text: str, kind: str) -> tuple[str, bool]:
     return text[:pos] + cue + text[pos:], True
 
 
-def prepare_subtitle(src: Path, workdir: Path) -> tuple[Path, list[str]]:
+def prepare_subtitle(src: Path, workdir: Path,
+                     hdr_transfer: str = "") -> tuple[Path, list[str]]:
     """
-    把字幕复制到工作目录，并做两件事：
+    把字幕复制到工作目录，并做三件事：
       1. 统一转成 UTF-8（GBK 老字幕也能被 libass 正确渲染）
       2. 注入"牺牲事件"，规避第一条字幕被吞的 bug
+      3. HDR 片源：把 ASS/SSA 里的 SDR 颜色预映射成 PQ/HLG 码值
+         （SRT/VTT 没有样式表，由 hdr_sub_force_style() 交给 subtitles 滤镜）
     """
     notes: list[str] = []
     text, enc = read_text_any(src)
@@ -677,6 +884,12 @@ def prepare_subtitle(src: Path, workdir: Path) -> tuple[Path, list[str]]:
         done = False
     if done:
         notes.append("已插入首条字幕保护（规避 ffmpeg 吞掉第一条字幕）")
+
+    if hdr_transfer and ext in (".ass", ".ssa"):
+        text, colors = remap_ass_colors(text, hdr_transfer)
+        if colors:
+            notes.append(f"HDR 字幕配色已预映射（{HDR_TRANSFERS.get(hdr_transfer, hdr_transfer)}，"
+                         f"SDR 白 ≈ {HDR_SUB_WHITE_NITS:.0f}nit）")
 
     tmp.write_text(text, encoding="utf-8", newline="")
     return tmp, notes
@@ -891,8 +1104,11 @@ def pick_output_ext(video: Path, codec: str) -> str:
     return ".mkv"
 
 
-def sub_filter_opts(sub_tmp: Path, fonts_dir: Path | None) -> str:
+def sub_filter_opts(sub_tmp: Path, fonts_dir: Path | None,
+                    force_style: str = "") -> str:
     s = "subtitles=" + escape_filter_path(sub_tmp)
+    if force_style:
+        s += ":force_style='" + force_style + "'"
     if fonts_dir:
         s += ":fontsdir=" + escape_filter_path(fonts_dir)
     return s
@@ -900,9 +1116,9 @@ def sub_filter_opts(sub_tmp: Path, fonts_dir: Path | None) -> str:
 
 def build_ffmpeg_cmd(ffmpeg: str, plan: Plan, media: Media, sub_tmp: Path, out_path: Path,
                      fonts_dir: Path | None, threads: int, loglevel: str,
-                     tonemap_filters: str = "") -> list[str]:
-    plan.filters = build_filters(sub_filter_opts(sub_tmp, fonts_dir), plan.accel,
-                                 plan.pix_fmt, tonemap_filters, plan.hw_pix_fmt)
+                     tonemap_filters: str = "", hdr_sub_style: str = "") -> list[str]:
+    plan.filters = build_filters(sub_filter_opts(sub_tmp, fonts_dir, hdr_sub_style),
+                                 plan.accel, plan.pix_fmt, tonemap_filters, plan.hw_pix_fmt)
 
     cmd = [ffmpeg, "-hide_banner", "-loglevel", loglevel, "-y", "-nostdin"]
     cmd += plan.input_opts
@@ -953,12 +1169,13 @@ def pick_error_line(stderr: str) -> str:
 
 
 def validate_chain(ffmpeg: str, plan: Plan, media: Media, sub_tmp: Path,
-                   fonts_dir: Path | None, tonemap_filters: str = "") -> tuple[bool, str]:
+                   fonts_dir: Path | None, tonemap_filters: str = "",
+                   hdr_sub_style: str = "") -> tuple[bool, str]:
     """
     正式压制前用真实视频试跑 0.5 秒整条链路（硬解 + 滤镜 + 编码）。
     硬件方案常常"能列出编码器但跑不动"，提前 0.5 秒验证可以避免白等一小时。
     """
-    filters = build_filters(sub_filter_opts(sub_tmp, fonts_dir), plan.accel,
+    filters = build_filters(sub_filter_opts(sub_tmp, fonts_dir, hdr_sub_style), plan.accel,
                             plan.pix_fmt, tonemap_filters, plan.hw_pix_fmt)
     cmd = [ffmpeg, "-hide_banner", "-v", "error", "-y"]
     cmd += plan.input_opts
@@ -1532,16 +1749,24 @@ def main(argv: list[str] | None = None) -> int:
 
     tmpdir = Path(tempfile.mkdtemp(prefix="hardsub_"))
     try:
-        sub_tmp, notes = prepare_subtitle(sub, tmpdir)
+        # HDR 片源默认保留 HDR：字幕颜色必须预映射，否则 SDR 白在 PQ 里接近峰值亮度。
+        # 这一步是静默的：SDR 片源根本不会走到这里（hdr_transfer 为空）。
+        hdr_transfer = (src.color_transfer or "smpte2084") if plan.hdr else ""
+        sub_tmp, notes = prepare_subtitle(sub, tmpdir, hdr_transfer)
         for n in notes:
             info(n)
         fonts_dir = (Path(args.fontsdir).resolve() if args.fontsdir
                      else find_fonts_dir(video.parent, sub.parent))
         if fonts_dir:
             info(f"字体目录: {fonts_dir}")
+        hdr_sub_style = ""
+        if plan.hdr and sub.suffix.lower() in (".srt", ".vtt"):
+            hdr_sub_style = hdr_sub_force_style(hdr_transfer)
+            info(f"HDR 字幕配色已预映射（{src.hdr or 'HDR'}，"
+                 f"SDR 白 ≈ {HDR_SUB_WHITE_NITS:.0f}nit）")
 
         cmd = build_ffmpeg_cmd(ffmpeg, plan, src, sub_tmp, out_path, fonts_dir,
-                               args.threads, "warning", tonemap_filters)
+                               args.threads, "warning", tonemap_filters, hdr_sub_style)
         log("")
         log("=" * 68)
         log(f"  输入    : {video}")
@@ -1562,7 +1787,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if plan.accel != "cpu":
             log("正在试跑 0.5 秒验证硬件链路...")
-            good, why = validate_chain(ffmpeg, plan, src, sub_tmp, fonts_dir, tonemap_filters)
+            good, why = validate_chain(ffmpeg, plan, src, sub_tmp, fonts_dir,
+                                       tonemap_filters, hdr_sub_style)
             if good:
                 ok("硬件链路正常")
             else:
@@ -1571,7 +1797,7 @@ def main(argv: list[str] | None = None) -> int:
                 plan = build_plan(ffmpeg, "cpu", codec, default_quality_for(codec, "cpu"),
                                   src, tonemapped=bool(tonemap_filters))
                 cmd = build_ffmpeg_cmd(ffmpeg, plan, src, sub_tmp, out_path, fonts_dir,
-                                       args.threads, "warning", tonemap_filters)
+                                       args.threads, "warning", tonemap_filters, hdr_sub_style)
                 log(f"  改用: {plan.encoder} {' '.join(plan.enc_params)}")
 
         if not args.yes and sys.stdin.isatty() and not ask_yes("确认开始压制？"):
