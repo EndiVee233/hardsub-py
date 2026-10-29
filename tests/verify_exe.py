@@ -125,7 +125,7 @@ def main() -> int:
             check("HDR 色彩标签保留",
                   got.color_transfer == "smpte2084" and got.color_primaries == "bt2020",
                   f"{got.color_primaries}/{got.color_transfer}")
-            check("HDR 字幕在画面里", T.brightness_at(out_hdr, 0.04, size="320x180") > 5)
+            check("HDR 字幕在画面里", T.max_luma10(out_hdr, 0.04) > 500)
 
         out_sdr = d / "hdr 转 sdr.mp4"
         r = run_exe(["-v", str(hdr_video), "-s", str(hdr_ass), "-a", "cpu", "-c", "h265",
