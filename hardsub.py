@@ -23,6 +23,9 @@ hardsub.py — 智能硬编码(烧录)字幕 · 命令行版
      会白得刺眼），彩色内联覆盖也一起处理。--tonemap 仍可把 HDR 转成 SDR（BT.709 8bit）。
   8. 进度条不会再被 ffmpeg 的警告卡住：stdout/stderr 各一个读取线程，进度字段三级回退，
      结束时汇总警告、失败时打印真正的错误行。
+  9. 逐词高亮（Default 样式里 {\\c&H...&}word{\\c...} 这种写法）会把亮起词的主色和
+     描边色按色相归一到 1000nit（HDR 峰值），不管这个单词是白、橙、青还是紫都能
+     顶满亮度；普通文字和其他样式仍按 203nit 图形白映射。
 
 用法示例：
   hardsub.exe                                    交互式，扫描当前目录
@@ -49,7 +52,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".flv", ".webm", ".avi", ".m4v", ".ts",
               ".wmv", ".mpg", ".mpeg", ".rmvb")
@@ -91,7 +94,8 @@ UNKNOWN_TAGS = {"", "unknown", "unspecified", "reserved", "n/a", "none"}
 #   HLG : 白 ≈ 191/255（0.75 信号，1000nit 屏上 ≈ 203nit）
 # 只改颜色（含 \c / \1c..\4c 内联覆盖），字号、位置、透明度、渐变时序都不动。
 # 这样 HDR 片源正常走 10bit HDR 链路，字幕亮度也和 SDR 下看起来一致。
-HDR_SUB_WHITE_NITS = 203.0       # BT.2408 图形白
+HDR_SUB_WHITE_NITS = 203.0       # BT.2408 图形白（普通字幕）
+HDR_HIGHLIGHT_NITS = 1000.0      # 逐词高亮的目标亮度（HDR10 常见峰值）
 HDR_HLG_PEAK_NITS = 1000.0       # HLG 参考显示峰值
 HDR_HLG_GAMMA = 1.2              # BT.2100 系统 gamma
 
@@ -634,25 +638,39 @@ def _hlg_signal(nits: float) -> float:
     return HLG_A * math.log(12.0 * e - HLG_B) + HLG_C
 
 
-_HDR_COLOR_CACHE: dict[tuple[int, int, int, str], tuple[int, int, int]] = {}
+_HDR_COLOR_CACHE: dict[tuple[int, int, int, str, bool], tuple[int, int, int]] = {}
 
 
-def map_sdr_color_to_hdr(rgb: tuple[int, int, int], transfer: str) -> tuple[int, int, int]:
+def map_sdr_color_to_hdr(rgb: tuple[int, int, int], transfer: str,
+                         peak_luma: bool = False) -> tuple[int, int, int]:
     """
     把一个 SDR 字幕颜色（BT.709 / sRGB）映射成 HDR 视频里该用的码值。
 
     线性光下 709 -> 2020 换色域，再按 203nit 图形白编码成 PQ 或 HLG 信号。
     白色在 PQ 下是 148、HLG 下是 191；黑色仍是 0，中间色按亮度比例变化。
+
+    peak_luma=True 用于卡拉OK的"亮起"词：保留色相，把该颜色在线性光下整体
+    缩放到 HDR_HIGHLIGHT_NITS（默认 1000nit）。这样高亮色不管是白、橙、青还是紫，
+    都能顶满目标亮度，而不会被按原色亮度映射成偏暗的颜色。
     """
-    key = (int(rgb[0]), int(rgb[1]), int(rgb[2]), transfer)
+    key = (int(rgb[0]), int(rgb[1]), int(rgb[2]), transfer, bool(peak_luma))
     cached = _HDR_COLOR_CACHE.get(key)
     if cached is not None:
         return cached
     lin = [_srgb_to_linear(c) for c in key[:3]]
+    channels = [max(0.0, row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2])
+                for row in BT709_TO_BT2020]
+    if peak_luma:
+        # BT.2020 亮度系数；把颜色缩放到目标亮度（逐词高亮默认 1000nit）
+        luma = 0.2627 * channels[0] + 0.6780 * channels[1] + 0.0593 * channels[2]
+        if luma > 1e-6:
+            scale = (HDR_HIGHLIGHT_NITS / HDR_SUB_WHITE_NITS) / luma
+            channels = [c * scale for c in channels]
+        else:
+            channels = [0.0, 0.0, 0.0]
     out: list[int] = []
-    for row in BT709_TO_BT2020:
-        value = row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2]
-        nits = max(0.0, value) * HDR_SUB_WHITE_NITS
+    for value in channels:
+        nits = value * HDR_SUB_WHITE_NITS
         signal = _pq_signal(nits) if transfer != "arib-std-b67" else _hlg_signal(nits)
         out.append(max(0, min(255, int(round(signal * 255.0)))))
     result = (out[0], out[1], out[2])
@@ -697,29 +715,68 @@ def format_ass_color(rgb: tuple[int, int, int], alpha: int, width: int) -> str:
 
 _HDR_INLINE_COLOR_RE = re.compile(r"\\([1-4]?[cC])&[Hh]([0-9A-Fa-f]{1,8})(&?)")
 
+# 逐词高亮（SubFabric 那类"每个词单独一条事件"的写法）：
+#   {\c&HFEFFFE&\3c&HFF00FF&\3a&H40&\blur12.0}the{\c\3c\3a\blur}
+# 起始块设置主色/描边色/透明度/模糊，单词后面用无参数的 \c 复位。
+# 只对 Default 样式做"高亮词顶满 1000nit"，其他样式（翻译/特效）保持普通映射。
+HDR_HIGHLIGHT_STYLE = "Default"
+_HIGHLIGHT_START_RE = re.compile(
+    r"\{[^}]*\\1?c&H[0-9A-Fa-f]{6}&[^}]*\}", re.IGNORECASE)
+_HIGHLIGHT_RESET_RE = re.compile(r"\{\\c(?![&H])[^}]*\}", re.IGNORECASE)
 
-def remap_ass_colors(text: str, transfer: str) -> tuple[str, int]:
+
+def highlight_spans(line: str) -> list[tuple[int, int]]:
+    """
+    找出一行事件里"亮起的词"的字符区间 [start, end)。
+    起点是带 \\c&H...& 的覆盖块，终点是后面第一个不带颜色的 \\c 复位块。
+    没有复位块的不算（普通彩色文字），避免把整行都当成高亮。
+    """
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    while True:
+        start = _HIGHLIGHT_START_RE.search(line, pos)
+        if start is None:
+            break
+        reset = _HIGHLIGHT_RESET_RE.search(line, start.end())
+        if reset is None:
+            break
+        spans.append((start.start(), reset.start()))
+        pos = reset.start()
+    return spans
+
+
+def remap_ass_colors(text: str, transfer: str,
+                     karaoke_peak: bool = True) -> tuple[str, int]:
     """
     把 ASS/SSA 里所有 SDR 颜色改成 HDR 码值：样式表 4 个颜色 + 内联 \\c/\\1c..\\4c。
     返回 (新文本, 改动处数)。事件文本里的内联覆盖也一并处理，避免彩色字幕过曝。
+
+    karaoke_peak=True 时，Default 样式里"亮起的词"（\\c&H...& ... {\\c...} 区间）
+    的主色和描边色会额外顶满到 1000nit；普通文字仍按 203nit 图形白映射。
     """
     lines = text.splitlines()
     newline = "\r\n" if "\r\n" in text else "\n"
     changed = 0
     in_styles = False
+    in_events = False
     fields: list[str] | None = None
+    event_fields: list[str] | None = None
     default_fields = ["name", "fontname", "fontsize", "primarycolour", "secondarycolour",
                       "outlinecolour", "backcolour", "bold", "italic", "underline",
                       "strikeout", "scalex", "scaley", "spacing", "angle", "borderstyle",
                       "outline", "shadow", "alignment", "marginl", "marginr", "marginv",
                       "encoding"]
+    default_event_fields = ["layer", "start", "end", "style", "name", "marginl",
+                            "marginr", "marginv", "effect", "text"]
 
     for i, line in enumerate(lines):
         stripped = line.strip()
         low = stripped.lower()
         if low.startswith("[") and low.endswith("]"):
             in_styles = low in ("[v4+ styles]", "[v4 styles]", "[v4++ styles]")
+            in_events = low == "[events]"
             fields = None
+            event_fields = None
             continue
 
         if in_styles:
@@ -750,8 +807,22 @@ def remap_ass_colors(text: str, transfer: str) -> tuple[str, int]:
                         changed += 1
                 continue
 
+        if in_events and low.startswith("format:"):
+            event_fields = [p.strip().lower() for p in stripped.split(":", 1)[1].split(",")]
+            continue
+
         if low.startswith(("dialogue:", "comment:")):
-            def repl(match: re.Match[str]) -> str:
+            spans: list[tuple[int, int]] = []
+            if karaoke_peak:
+                use_fields = event_fields or default_event_fields
+                parts = stripped.split(":", 1)[1].split(",", len(use_fields) - 1)
+                if len(parts) == len(use_fields):
+                    style_idx = use_fields.index("style") if "style" in use_fields else 3
+                    style_name = parts[style_idx].strip() if style_idx < len(parts) else ""
+                    if style_name.lower() == HDR_HIGHLIGHT_STYLE.lower():
+                        spans = highlight_spans(line)
+
+            def repl(match: re.Match[str], spans: list[tuple[int, int]] = spans) -> str:
                 prefix, digits, tail = match.group(1), match.group(2), match.group(3)
                 width = 8 if len(digits) > 6 else 6
                 number = int(digits, 16)
@@ -759,7 +830,11 @@ def remap_ass_colors(text: str, transfer: str) -> tuple[str, int]:
                 b = (number >> 16) & 0xFF
                 g = (number >> 8) & 0xFF
                 r = number & 0xFF
-                nr, ng, nb = map_sdr_color_to_hdr((r, g, b), transfer)
+                tag = prefix.lower()
+                in_highlight = (tag in ("c", "1c", "3c")
+                                and any(start <= match.start() < end for start, end in spans))
+                nr, ng, nb = map_sdr_color_to_hdr((r, g, b), transfer,
+                                                 peak_luma=in_highlight)
                 digits_out = (f"{a:02X}{nb:02X}{ng:02X}{nr:02X}" if width == 8
                               else f"{nb:02X}{ng:02X}{nr:02X}")
                 return f"\\{prefix}&H{digits_out}{tail}"
@@ -861,13 +936,15 @@ def inject_sacrificial_cue(text: str, kind: str) -> tuple[str, bool]:
 
 
 def prepare_subtitle(src: Path, workdir: Path,
-                     hdr_transfer: str = "") -> tuple[Path, list[str]]:
+                     hdr_transfer: str = "",
+                     karaoke_peak: bool = True) -> tuple[Path, list[str]]:
     """
     把字幕复制到工作目录，并做三件事：
       1. 统一转成 UTF-8（GBK 老字幕也能被 libass 正确渲染）
       2. 注入"牺牲事件"，规避第一条字幕被吞的 bug
       3. HDR 片源：把 ASS/SSA 里的 SDR 颜色预映射成 PQ/HLG 码值
          （SRT/VTT 没有样式表，由 hdr_sub_force_style() 交给 subtitles 滤镜）
+         逐词高亮的 Default 行还会把高亮词顶满到 1000nit。
     """
     notes: list[str] = []
     text, enc = read_text_any(src)
@@ -886,7 +963,7 @@ def prepare_subtitle(src: Path, workdir: Path,
         notes.append("已插入首条字幕保护（规避 ffmpeg 吞掉第一条字幕）")
 
     if hdr_transfer and ext in (".ass", ".ssa"):
-        text, colors = remap_ass_colors(text, hdr_transfer)
+        text, colors = remap_ass_colors(text, hdr_transfer, karaoke_peak=karaoke_peak)
         if colors:
             notes.append(f"HDR 字幕配色已预映射（{HDR_TRANSFERS.get(hdr_transfer, hdr_transfer)}，"
                          f"SDR 白 ≈ {HDR_SUB_WHITE_NITS:.0f}nit）")

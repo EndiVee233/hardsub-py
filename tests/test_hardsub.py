@@ -393,6 +393,95 @@ class TestHdrSubtitleColor(unittest.TestCase):
         self.assertEqual(changed, 0)
         self.assertEqual(out, text)
 
+    def test_peak_luma_hits_1000nit_for_any_color(self):
+        """卡拉OK高亮色按色相保留、亮度归一到 1000nit（不是按原色亮度变暗）。"""
+        def nits(code: int) -> float:
+            e = code / 255.0
+            m1, m2 = 0.1593017578125, 78.84375
+            c1, c2, c3 = 0.8359375, 18.8515625, 18.6875
+            p = e ** (1 / m2)
+            return ((max(p - c1, 0) / (c2 - c3 * p)) ** (1 / m1)) * 10000.0
+
+        for rgb in ((255, 0, 255), (255, 199, 142), (0, 128, 255)):
+            mapped = hardsub.map_sdr_color_to_hdr(rgb, "smpte2084", peak_luma=True)
+            r, g, b = (nits(c) for c in mapped)
+            luma = 0.2627 * r + 0.6780 * g + 0.0593 * b
+            self.assertAlmostEqual(luma, hardsub.HDR_HIGHLIGHT_NITS, delta=25.0,
+                                   msg=f"{rgb} -> {mapped}")
+        # 白色顶到 1000nit；黑色仍是黑
+        self.assertEqual(hardsub.map_sdr_color_to_hdr((255, 255, 255), "smpte2084", True),
+                         (192, 192, 192))
+        self.assertEqual(hardsub.map_sdr_color_to_hdr((0, 0, 0), "smpte2084", True),
+                         (0, 0, 0))
+
+    def test_highlight_spans_finds_word_and_ignores_unreset_color(self):
+        line = (r"Dialogue: 0,0:00:01.11,0:00:01.19,Default,Spoke,0,0,0,,This is "
+                r"{\c&HFEFFFE&\3c&HFF00FF&\3a&H40&\blur12.0}the{\c\3c\3a\blur} Unstable")
+        spans = hardsub.highlight_spans(line)
+        self.assertEqual(len(spans), 1)
+        start, end = spans[0]
+        self.assertIn("the", line[start:end])
+        self.assertNotIn("Unstable", line[start:end])
+        self.assertEqual(hardsub.highlight_spans(
+            r"Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\c&HFF0000&}red"), [])
+        two = (r"Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,"
+               r"{\c&HFF0000&}one{\c} {\c&H00FF00&}two{\c}")
+        self.assertEqual(len(hardsub.highlight_spans(two)), 2)
+
+    def test_karaoke_highlight_peaks_only_in_default_style(self):
+        text = "\n".join([
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+            "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+            "MarginL, MarginR, MarginV, Encoding",
+            "Style: Default,Comic Sans MS,53,&H00828282,&H0000FFFF,&H00000000,"
+            "&H00000000,-1,0,0,0,100,100,0,0,1,3,3,2,20,20,120,1",
+            "Style: 中文字幕,猫啃什锦黑,58,&H0000FFFF,&H0000FFFF,&H00000000,"
+            "&H00000000,-1,0,0,0,100,100,0,0,1,3.0,2,2,10,10,125,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            r"Dialogue: 0,0:00:01.11,0:00:01.19,Default,Spoke,0,0,0,,This is "
+            r"{\c&HFEFFFE&\3c&HFF00FF&\3a&H40&\blur12.0}the{\c\3c\3a\blur} SMP",
+            r"Dialogue: 0,0:00:01.11,0:00:01.19,中文字幕,Spoke,0,0,0,,"
+            r"{\c&HFF00FF&}中文",
+        ])
+        out, _ = hardsub.remap_ass_colors(text, "smpte2084")
+        self.assertIn(r"{\c&HC0C0C0&\3c&HE09DD8&\3a&H40&\blur12.0}the{\c\3c\3a\blur}",
+                      out)
+        # 样式里的灰字仍按普通映射（不是高亮色），复位块保持无参数
+        self.assertIn("&H006E6E6E", out)
+        # 其他样式里的内联颜色只做普通映射
+        self.assertIn(r"{\c&H92578A&}中文", out)
+
+        normal, _ = hardsub.remap_ass_colors(text, "smpte2084", karaoke_peak=False)
+        self.assertIn(r"\3c&H92578A", normal)
+        self.assertNotIn(r"\3c&HE09DD8", normal)
+
+    def test_karaoke_peak_can_be_disabled_in_prepare(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "k.ass"
+            src.write_text(
+                "[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+                "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+                "MarginL, MarginR, MarginV, Encoding\n"
+                "Style: Default,Arial,20,&H00828282,&H00FFFFFF,&H00000000,&H00000000,"
+                "0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n"
+                "\n[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+                "MarginV, Effect, Text\n"
+                "Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,"
+                "{\\c&HFF00FF&\\3c&H00FFFF&}hi{\\c\\3c}\n",
+                encoding="utf-8")
+            peak, _ = hardsub.prepare_subtitle(src, Path(d), "smpte2084")
+            peak_text = peak.read_text(encoding="utf-8")
+            plain, _ = hardsub.prepare_subtitle(src, Path(d), "smpte2084", karaoke_peak=False)
+            self.assertIn("E09DD8", peak_text)
+            self.assertNotIn("E09DD8", plain.read_text(encoding="utf-8"))
+
     def test_srt_force_style_uses_hdr_white(self):
         style = hardsub.hdr_sub_force_style("smpte2084")
         self.assertIn("PrimaryColour=&H00949494", style)

@@ -25,7 +25,7 @@
 | 硬件链路失败 → 白跑到一半报错 | 试跑失败自动回退 CPU，并告诉你原因 |
 | CPU 路径也带 `hwdownload`，软解时可能直接报错 | CPU 路径干净，不依赖硬件帧 |
 | `libsvtav1` 配 `-preset medium` → 必报错 | 按编码器给正确参数 |
-| **HDR 视频** 被压成 8bit，或硬件链路直接报 `Invalid output format nv12 for hwframe download` | 自动识别 HDR10 / HLG，全程 10bit（`yuv420p10le` / `p010le`），写回 BT.2020 + PQ/HLG 标签和 HDR10 静态元数据；HDR 源静默走 HDR 链路，普通源走普通链路；字幕颜色按 203nit 预映射，不会白得刺眼；`--tonemap` 可转 SDR |
+| **HDR 视频** 被压成 8bit，或硬件链路直接报 `Invalid output format nv12 for hwframe download` | 自动识别 HDR10 / HLG，全程 10bit（`yuv420p10le` / `p010le`），写回 BT.2020 + PQ/HLG 标签和 HDR10 静态元数据；HDR 源静默走 HDR 链路，普通源走普通链路；字幕颜色按 203nit 预映射，逐词高亮词顶到 1000nit，不会白得刺眼；`--tonemap` 可转 SDR |
 | 进度条在有些情况下不动（ffmpeg 警告塞满 stderr 管道 / 旧版 ffmpeg 没有 `out_time_us`） | stdout、stderr 各一个读取线程；进度字段三级回退；长时间没进度会提示 `[等待 ffmpeg…]`；结束时汇总警告 |
 | 没有进度、压完不知道对不对 | 进度条 + 压制后自检（时长 / 分辨率 / 音轨数 / HDR 元数据） |
 | 只能人工交互 | 全参数化，可脚本化调度 |
@@ -132,6 +132,33 @@ HDR 链路会把字幕颜色**预映射**到 HDR 的码值，再交给 libass �
 - 已知限制：SRT/VTT 内联的 `<font color="#...">` 不会被换算（会按 SDR 色显示得偏亮）；
   需要精确配色的字幕请用 ASS/SSA。位图字幕（PGS/VobSub）本来就不在支持范围内。
 
+### 逐词高亮（卡拉OK）字幕
+
+`Default` 样式里常见这种"每个词单独一条事件 + 内联颜色"的逐词高亮：
+
+```ass
+{\c&HFEFFFE&\3c&HFF00FF&\3a&H40&\blur12.0}the{\c\3c\3a\blur}
+```
+
+如果按普通映射，`\c` 和 `\3c` 会按原色亮度变暗：橙、青、紫这些高亮色本来就比白色暗，
+映射后更不"亮"。HDR 链路对 **Default 样式**里这种带复位块的 `{\c&H...&}...{\c...}`
+区间额外做一层处理：
+
+- 主色（`\c` / `\1c`）和描边色（`\3c`）在线性光下按色相归一到 **1000nit**
+  （HDR10 常见峰值），所以每次亮起的词不管原来是白、橙、青还是紫，都能顶满亮度；
+- `\3a` 透明度、`\blur`、字号、位置、复位块都不动；
+- 其他样式（如翻译/中文字幕）和普通文字仍按 203nit 图形白映射，不会被一起提亮。
+
+例如上面的块在 HDR10 下会变成：
+
+```ass
+{\c&HC0C0C0&\3c&HE09DD8&\3a&H40&\blur12.0}the{\c\3c\3a\blur}
+```
+
+也就是说：白色填充从 203nit 提到 1000nit，洋红描边也从普通映射的约 59nit 提到
+1000nit，但仍然是洋红色，不会变成白色。1000nit 已接近大多数 HDR10 片的峰值，
+如果显示设备峰值较低，播放器/电视会自己做 tone mapping。
+
 要在普通 SDR 屏幕上看，加 `--tonemap`：优先用 `zscale + tonemap(hable)`（纯 CPU），
 没有 libzimg 的 ffmpeg 会退到 `libplacebo`。字幕在 tonemap **之后**才烧，
 所以字幕是正常的 SDR 白色，不会被一起压暗；这种情况下不做 HDR 配色映射。
@@ -156,7 +183,7 @@ ffmpeg 就卡在写日志上：进程还在、视频不再前进、进度条一�
 
 ```bash
 python hardsub.py --probe                     # 直接跑源码
-python tests\test_hardsub.py                  # 63 项单元 + 集成测试（含 HDR 配色 / 进度回归）
+python tests\test_hardsub.py                  # 67 项单元 + 集成测试（含 HDR 配色 / 逐词高亮 / 进度回归）
 python tests\verify_exe.py                    # exe 黑盒验证（需先打包出 exe）
 
 # 打包成单文件 exe
